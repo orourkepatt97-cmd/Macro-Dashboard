@@ -1,0 +1,20 @@
+# Bloomberg-terminal palette. Fine-grained styling (fonts, metrics, headers,
+# spacing) is injected as CSS from theme.py; this file sets the base colours so
+# Streamlit's own chrome matches before that CSS loads.
+[theme]
+base = "dark"
+# Chrome accent only. The orange (#ff9900) is applied via theme.py to data
+# elements (chart series, headline links), never to Streamlit's own widgets.
+primaryColor = "#9a9a9a"
+backgroundColor = "#0a0a0a"
+secondaryBackgroundColor = "#141414"
+textColor = "#d0d0d0"
+font = "monospace"
+
+[client]
+# "viewer" keeps the top-right (...) menu visible with viewer options (Print,
+# Record screen, About) and no developer items. "minimal" had removed it entirely.
+toolbarMode = "viewer"
+
+[server]
+runOnSave = true
