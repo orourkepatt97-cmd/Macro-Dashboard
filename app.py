@@ -6,7 +6,8 @@ here comes from ``data.py``.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -43,6 +44,16 @@ def _sign_color(value: float) -> str | None:
     if pd.isna(value) or value == 0:
         return None
     return f"color: {_GREEN if value > 0 else _RED}"
+
+
+# Feeds and Kalshi both return UTC; every displayed timestamp is shown in US
+# Eastern (zoneinfo handles the EST/EDT switch) with an explicit "ET" suffix.
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _et(dt: datetime, fmt: str = "%b %d, %Y · %H:%M") -> str:
+    """A tz-aware datetime rendered in US Eastern time, suffixed with 'ET'."""
+    return dt.astimezone(_EASTERN).strftime(fmt) + " ET"
 
 
 # Series specs for the pill selectors that replace the Plotly legends. The
@@ -289,7 +300,7 @@ with rates_tab:
         )
         st.caption(
             "Implied probability from Kalshi market prices for the next two FOMC "
-            f"meetings · prices fetched {fed_fetched.astimezone():%b %d, %H:%M %Z}"
+            f"meetings · prices fetched {_et(fed_fetched, '%b %d, %H:%M')}"
         )
 
     with st.expander("Yield data"):
@@ -499,11 +510,7 @@ with news_tab:
                 except Exception:  # noqa: BLE001 — broken image URL must not kill the card
                     img_col.markdown("📄")
 
-            when = (
-                item["published"].astimezone().strftime("%b %d, %Y · %H:%M")
-                if item["published"]
-                else "date unknown"
-            )
+            when = _et(item["published"]) if item["published"] else "date unknown"
             text_col.markdown(f"**[{item['title']}]({item['link']})**")
             text_col.caption(f"{item['source']}  ·  {when}")
             if item["summary"]:
