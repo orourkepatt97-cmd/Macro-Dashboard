@@ -45,13 +45,15 @@ TENOR_LINE: dict[str, dict] = {
 # st.pills toggle groups that double as chart legends. Each key maps to the
 # ordered list of line colours for its options; the pill for option N is tinted
 # colour N and gets a 2px underline in that colour when selected. Colours must
-# match the trace colours set in app.py (_CREDIT_SPEC / _INFLATION_SPEC) and
-# TENOR_LINE, in the same option order.
+# match the trace colours set in app.py (_CREDIT_SPEC / _INFLATION_SPEC /
+# _LABOR_UR_SPEC / _CLAIMS_SPEC) and TENOR_LINE, in the same option order.
 _PILL_TINTS: dict[str, list[str]] = {
     "tenors": [TENOR_LINE[sid]["color"]
                for sid in ("DGS3MO", "DGS2", "DGS5", "DGS10", "DGS30")],
     "credit_series": ["#cf9038", "#d0d0d0", "#e05252", "#7f8fbf"],   # HY OAS, IG OAS, HY-IG, 2s10s
-    "inflation_series": ["#cf9038", "#d0d0d0", "#7f8fbf"],            # CPI, Core PCE, 10Y breakeven
+    "inflation_series": ["#cf9038", "#e05252", "#d0d0d0", "#7f8fbf"],  # CPI, Core CPI, Core PCE, 10Y breakeven
+    "labor_ur": ["#cf9038", "#7f8fbf"],                              # Unemployment, Participation
+    "labor_claims": ["#cf9038", "#e05252", "#7f8fbf"],               # Initial, Initial 4wk avg, Continuing
 }
 
 # Every pill group that uses the borderless underline style. The tinted ones

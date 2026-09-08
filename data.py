@@ -8,6 +8,7 @@ directly.
 from __future__ import annotations
 
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -16,25 +17,36 @@ import streamlit as st
 from dotenv import load_dotenv
 
 
-def _load_fred_api_key() -> str | None:
-    """The FRED key from ``st.secrets`` when running on Streamlit Community
-    Cloud, falling back to a local ``.env`` file or a plain environment
-    variable — so the same code runs in both places."""
+def _load_api_key(name: str) -> str | None:
+    """An API key from ``st.secrets`` when running on Streamlit Community Cloud,
+    falling back to a local ``.env`` file or a plain environment variable — so
+    the same code runs in both places."""
     try:
-        secret = st.secrets.get("FRED_API_KEY")
+        secret = st.secrets.get(name)
         if secret:
             return str(secret)
     except Exception:  # noqa: BLE001 - no secrets.toml locally is expected
         pass
     load_dotenv()
-    return os.getenv("FRED_API_KEY")
+    return os.getenv(name)
 
 
-FRED_API_KEY = _load_fred_api_key()
+FRED_API_KEY = _load_api_key("FRED_API_KEY")
 FRED_BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+# Cleveland Fed inflation nowcasting — headline & core CPI/PCE nowcasts. This is
+# NOT on FRED; it comes from the Cleveland Fed's own webchart data feed.
+CLEVELAND_NOWCAST_URL = (
+    "https://www.clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_year.json"
+)
+
+# FX Blue's public NFP calendar page — scraped for the consensus forecast.
+FXBLUE_NFP_URL = "https://api.fxblue.com/calendar/item/Nonfarm_Payrolls_US"
 
 # One hour: FRED daily series refresh about once per business day.
 _CACHE_TTL = 60 * 60
+_NOWCAST_TTL = 6 * 60 * 60   # the nowcast feed is ~7MB; refresh it sparingly
+_FXBLUE_TTL = 12 * 60 * 60
 
 # FRED constant-maturity Treasury series -> short label for the chart legend.
 # Dict order is the natural short->long curve order and drives the legend.
@@ -55,10 +67,11 @@ TENOR_YEARS: dict[str, float] = {
     "DGS30": 30.0,
 }
 
-# Inflation series -> label. CPI and core PCE are published as index levels and
-# are shown as year-over-year % change; T10YIE is already an annualised rate.
+# Inflation series -> label. CPI/core-CPI/core-PCE are published as index levels
+# and shown as year-over-year % change; T10YIE is already an annualised rate.
 INFLATION_SERIES: dict[str, str] = {
     "CPIAUCSL": "CPI (headline, YoY)",
+    "CPILFESL": "Core CPI (YoY)",
     "PCEPILFE": "Core PCE (YoY)",
     "T10YIE": "10Y breakeven",
 }
@@ -67,6 +80,18 @@ INFLATION_SERIES: dict[str, str] = {
 SERIES_FREQ: dict[str, str] = {
     "DGS3MO": "D", "DGS2": "D", "DGS5": "D", "DGS10": "D", "DGS30": "D",
     "CPIAUCSL": "M", "PCEPILFE": "M", "T10YIE": "D",
+}
+
+# Labor-market series. PAYEMS/CES0500000003 are levels (thousands of jobs,
+# dollars/hour) shown as MoM change and YoY %; the rest are already rates or
+# weekly claim counts.
+LABOR_SERIES: dict[str, str] = {
+    "PAYEMS": "Nonfarm payrolls",
+    "UNRATE": "Unemployment rate",
+    "CIVPART": "Participation rate",
+    "ICSA": "Initial claims",
+    "CCSA": "Continuing claims",
+    "CES0500000003": "Avg hourly earnings",
 }
 
 # ICE BofA option-adjusted credit spreads (FRED reports them in percentage
@@ -149,21 +174,23 @@ def fetch_treasury_yields(start_date: str, end_date: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=_CACHE_TTL, show_spinner="Fetching inflation data from FRED…")
 def fetch_inflation(start_date: str, end_date: str) -> pd.DataFrame:
-    """CPI & core PCE as YoY %, plus the 10Y breakeven rate (already %).
+    """CPI, core CPI & core PCE as YoY %, plus the 10Y breakeven rate (already %).
 
-    CPI/PCE come as index levels, so ~13 extra months are fetched before
+    The index series come as levels, so ~13 extra months are fetched before
     ``start_date`` to seed the trailing-12-month change; the result is then
     trimmed back to ``[start_date, end_date]``. Columns are the FRED ids.
     """
     lookback = (pd.Timestamp(start_date) - pd.DateOffset(months=13)).strftime("%Y-%m-%d")
 
     cpi = fetch_series("CPIAUCSL", lookback, end_date)
+    core_cpi = fetch_series("CPILFESL", lookback, end_date)
     pce = fetch_series("PCEPILFE", lookback, end_date)
     breakeven = fetch_series("T10YIE", lookback, end_date)
 
     frame = pd.DataFrame(
         {
             "CPIAUCSL": cpi.pct_change(12) * 100.0,
+            "CPILFESL": core_cpi.pct_change(12) * 100.0,
             "PCEPILFE": pce.pct_change(12) * 100.0,
             "T10YIE": breakeven,
         }
@@ -171,6 +198,236 @@ def fetch_inflation(start_date: str, end_date: str) -> pd.DataFrame:
     frame.index.name = "date"
     frame = frame.sort_index()
     return frame.loc[str(start_date):str(end_date)]
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner="Fetching labor data from FRED…")
+def fetch_labor(start_date: str, end_date: str) -> pd.DataFrame:
+    """Raw levels for the :data:`LABOR_SERIES`, one column per FRED id.
+
+    Fetches ~15 months before ``start_date`` so the caller's month-over-month
+    (PAYEMS), year-over-year (avg hourly earnings) and 4-week-average (initial
+    claims) derivations are populated from the first visible point. Callers
+    slice back to their display range; the metrics use the full frame so
+    "latest" is genuinely latest. Weekly and monthly series share one union
+    index, so every column carries NaNs — derive with ``.dropna()``.
+    """
+    lookback = (pd.Timestamp(start_date) - pd.DateOffset(months=15)).strftime("%Y-%m-%d")
+    frame = pd.DataFrame(
+        {series_id: fetch_series(series_id, lookback, end_date) for series_id in LABOR_SERIES}
+    )
+    frame.index.name = "date"
+    return frame.sort_index()
+
+
+# FOMC *decision days* (2nd day of each 2-day meeting) as published by the
+# Federal Reserve; the 2027 rows are the Fed's tentative schedule.
+_FOMC_DECISION_DAYS = (
+    "2026-01-28", "2026-03-18", "2026-04-29", "2026-06-17",
+    "2026-07-29", "2026-09-16", "2026-10-28", "2026-12-09",
+    "2027-01-27", "2027-03-17", "2027-04-28", "2027-06-16",
+    "2027-07-28", "2027-09-22", "2027-11-03", "2027-12-15",
+)
+
+
+def _num(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _last_nowcast(points: list[dict] | None) -> float | None:
+    """The last non-blank ``value`` in a Cleveland-Fed nowcast series — for a
+    past month this is the final pre-release nowcast, for the current month the
+    latest one."""
+    for point in reversed(points or []):
+        got = _num(point.get("value"))
+        if got is not None:
+            return round(got, 3)
+    return None
+
+
+def _cleveland_nowcasts() -> tuple[dict[pd.Timestamp, float], dict[pd.Timestamp, float], str | None]:
+    """``(cpi, core_cpi, note)`` — Cleveland Fed year-over-year CPI and core-CPI
+    inflation nowcasts keyed by reference month. Empty dicts + ``note`` on any
+    failure (the feed is a ~7 MB JSON on clevelandfed.org, not FRED)."""
+    try:
+        resp = requests.get(
+            CLEVELAND_NOWCAST_URL,
+            headers={"User-Agent": "macro-dashboard/1.0", "Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        vintages = resp.json()
+    except requests.RequestException as exc:
+        return {}, {}, f"Cleveland Fed nowcast feed unreachable ({type(exc).__name__})"
+    except ValueError:
+        return {}, {}, "Cleveland Fed nowcast feed returned non-JSON"
+
+    if not isinstance(vintages, list):
+        return {}, {}, "Cleveland Fed nowcast feed had an unexpected shape"
+
+    cpi: dict[pd.Timestamp, float] = {}
+    core: dict[pd.Timestamp, float] = {}
+    for vintage in vintages:
+        subcaption = str(vintage.get("chart", {}).get("subcaption", ""))  # "YYYY-M"
+        try:
+            year, month = (int(part) for part in subcaption.split("-"))
+            ref_month = pd.Timestamp(year, month, 1)
+        except (ValueError, TypeError):
+            continue
+        series = {s.get("seriesname"): s.get("data", []) for s in vintage.get("dataset", [])}
+        cpi_value = _last_nowcast(series.get("CPI Inflation"))
+        core_value = _last_nowcast(series.get("Core CPI Inflation"))
+        if cpi_value is not None:
+            cpi[ref_month] = cpi_value
+        if core_value is not None:
+            core[ref_month] = core_value
+
+    if not cpi and not core:
+        return {}, {}, "Cleveland Fed nowcast feed had no CPI data"
+    return cpi, core, None
+
+
+@st.cache_data(ttl=_NOWCAST_TTL, show_spinner=False)
+def fetch_cpi_nowcasts() -> tuple[pd.DataFrame, str | None]:
+    """``(frame, note)``. ``frame`` is indexed by reference month with columns
+    ``cpi_nowcast`` and ``core_cpi_nowcast`` — the Cleveland Fed's year-over-year
+    inflation nowcasts, in percent. ``note`` explains a fetch failure (the frame
+    is then empty and the Inflation-tab tooltips fall back to actual-only)."""
+    cpi, core, note = _cleveland_nowcasts()
+    months = pd.Index(sorted(set(cpi) | set(core)), name="date")
+    frame = pd.DataFrame(index=months)
+    frame["cpi_nowcast"] = pd.Series(cpi, dtype="float64")
+    frame["core_cpi_nowcast"] = pd.Series(core, dtype="float64")
+    return frame.sort_index(), note
+
+
+# One "Past events" row of FX Blue's NFP page: the release timestamp (ms) and the
+# forecast cell. The header row is "class=\"PastEventRow PastEventHeader\"", so
+# the exact "class=\"PastEventRow\"" (closing quote) only matches data rows.
+_FXBLUE_ROW_RE = re.compile(
+    r'class="PastEventRow"'
+    r'.*?class="CalendarDate"[^>]*\bts="(\d+)"'
+    r'.*?class="PastEventConsensus PastEventValue"[^>]*>([^<]*)</div>',
+    re.S,
+)
+
+
+def _parse_kmb(text: str) -> float | None:
+    """'56K' -> 56.0, '-23K' -> -23.0, '1.2M' -> 1200.0, '-' / '' -> None."""
+    cleaned = text.strip().replace(",", "")
+    if not cleaned or cleaned.strip("-–—") == "":
+        return None
+    multiplier = 1.0
+    if cleaned[-1:].lower() == "k":
+        cleaned = cleaned[:-1]
+    elif cleaned[-1:].lower() == "m":
+        cleaned, multiplier = cleaned[:-1], 1000.0
+    try:
+        return float(cleaned) * multiplier
+    except ValueError:
+        return None
+
+
+@st.cache_data(ttl=_FXBLUE_TTL, show_spinner=False)
+def fetch_nfp_forecasts() -> tuple[pd.Series, str | None]:
+    """``(forecasts, note)`` — consensus nonfarm-payrolls forecast in thousands,
+    indexed by *reference month*, scraped from the "Past events" table of FX
+    Blue's public NFP calendar page. A report released in month M covers month
+    M-1. Empty series + ``note`` on any failure; the tooltip then shows the
+    actual alone.
+    """
+    try:
+        resp = requests.get(
+            FXBLUE_NFP_URL, headers={"User-Agent": "macro-dashboard/1.0"}, timeout=20
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return pd.Series(dtype="float64"), f"FX Blue NFP page unreachable ({type(exc).__name__})"
+
+    forecasts: dict[pd.Timestamp, float] = {}
+    for ts_ms, forecast_text in _FXBLUE_ROW_RE.findall(resp.text):
+        value = _parse_kmb(forecast_text)
+        if value is None:
+            continue
+        try:
+            released = pd.Timestamp(int(ts_ms), unit="ms")
+        except (ValueError, OverflowError):
+            continue
+        ref_month = released.normalize().replace(day=1) - pd.DateOffset(months=1)
+        forecasts.setdefault(ref_month, value)
+
+    if not forecasts:
+        return pd.Series(dtype="float64"), "FX Blue NFP 'Past events' table had no forecasts"
+
+    series = pd.Series(forecasts, dtype="float64").sort_index()
+    series.index.name = "date"
+    return series, None
+
+
+# Recurring US data-release schedule. These series publish on fixed patterns;
+# day-of-month anchors below are the usual release day (verify exact dates
+# against the BLS / BEA / Census calendars). Everything is 08:30 ET.
+_MONTHLY_RELEASES = (
+    (12, "CPI"),
+    (13, "PPI"),
+    (16, "Retail sales"),
+    (27, "Personal income & outlays (PCE)"),
+)
+
+
+def _shift_off_weekend(day: pd.Timestamp) -> pd.Timestamp:
+    """Push a Sat/Sun onto the following Monday (agencies don't release then)."""
+    return day + pd.Timedelta(days={5: 2, 6: 1}.get(day.weekday(), 0))
+
+
+def release_calendar(days: int = 45) -> list[dict]:
+    """Scheduled US releases over the next ``days`` days, sorted by date.
+
+    Pure — no network. Each item: ``{"date": Timestamp, "time_et": "HH:MM",
+    "event": str}``. Covers CPI, PPI, payrolls, PCE, jobless claims and retail
+    sales (fixed schedules) plus scheduled FOMC decisions.
+    """
+    today = pd.Timestamp.today().normalize()
+    end = today + pd.Timedelta(days=days)
+    items: list[dict] = []
+
+    # Initial jobless claims — every Thursday.
+    thursday = today + pd.Timedelta(days=(3 - today.weekday()) % 7)
+    while thursday <= end:
+        items.append({"date": thursday, "time_et": "08:30", "event": "Initial jobless claims"})
+        thursday += pd.Timedelta(days=7)
+
+    for month_start in pd.date_range(today.replace(day=1), end + pd.Timedelta(days=31), freq="MS"):
+        # Employment Situation (payrolls & unemployment) — first Friday.
+        first_friday = month_start + pd.Timedelta(days=(4 - month_start.weekday()) % 7)
+        if today <= first_friday <= end:
+            items.append({"date": first_friday, "time_et": "08:30",
+                          "event": "Employment situation (payrolls)"})
+        # Monthly indicators, anchored to their usual day of month.
+        for day_of_month, name in _MONTHLY_RELEASES:
+            when = _shift_off_weekend(month_start + pd.Timedelta(days=day_of_month - 1))
+            if today <= when <= end:
+                items.append({"date": when, "time_et": "08:30", "event": name})
+
+    # Scheduled FOMC decisions in the window (announcement at 14:00 ET).
+    for day in fomc_meeting_dates(within_days=days):
+        items.append({"date": day, "time_et": "14:00", "event": "FOMC rate decision"})
+
+    items.sort(key=lambda it: (it["date"], it["time_et"]))
+    return items
+
+
+def fomc_meeting_dates(within_days: int = 365) -> list[pd.Timestamp]:
+    """Scheduled FOMC decision days from today through ``within_days`` out."""
+    today = pd.Timestamp.today().normalize()
+    horizon = today + pd.Timedelta(days=within_days)
+    return [
+        day
+        for day in (pd.Timestamp(x) for x in _FOMC_DECISION_DAYS)
+        if today <= day <= horizon
+    ]
 
 
 def spread(df: pd.DataFrame, short_id: str, long_id: str) -> pd.Series:

@@ -24,14 +24,19 @@ from data import (
     TREASURY_SERIES,
     changes_bps,
     fetch_change_window,
+    fetch_cpi_nowcasts,
     fetch_credit_spreads,
     fetch_credit_window,
     fetch_curve_snapshot,
     fetch_inflation,
+    fetch_labor,
+    fetch_nfp_forecasts,
     fetch_treasury_yields,
+    fomc_meeting_dates,
     latest_change,
     latest_observations,
     movement_table,
+    release_calendar,
     release_overdue,
     spread,
 )
@@ -67,8 +72,18 @@ _CREDIT_SPEC = [                      # (label, colour, on secondary axis)
 ]
 _INFLATION_SPEC = [                   # (FRED id, label, colour)
     ("CPIAUCSL", "CPI", "#cf9038"),
+    ("CPILFESL", "Core CPI", "#e05252"),
     ("PCEPILFE", "Core PCE", "#d0d0d0"),
     ("T10YIE", "10Y breakeven", "#7f8fbf"),
+]
+_LABOR_UR_SPEC = [                    # (label, colour) — one shared axis
+    ("Unemployment", "#cf9038"),
+    ("Participation", "#7f8fbf"),
+]
+_CLAIMS_SPEC = [                      # (label, colour, on secondary axis)
+    ("Initial claims", "#cf9038", False),
+    ("Initial 4wk avg", "#e05252", False),
+    ("Continuing claims", "#7f8fbf", True),
 ]
 
 
@@ -83,6 +98,22 @@ def _padded_range(series_list, pad_frac: float = 0.06):
     span = hi - lo
     pad = span * pad_frac if span else max(abs(hi) * 0.05, 1.0)
     return [lo - pad, hi + pad]
+
+
+def _consensus_hover(
+    dates, actuals, expecteds, *, header_fmt, value_fmt, surprise_fmt,
+    expected_label="Expected",
+):
+    """Per-point hover strings: actual always, expected + surprise only when a
+    forecast exists for that point (otherwise just the actual)."""
+    text = []
+    for when, actual, expected in zip(dates, actuals, expecteds):
+        rows = [f"<b>{when:{header_fmt}}</b>", f"Actual: {value_fmt.format(actual)}"]
+        if pd.notna(expected) and pd.notna(actual):
+            rows.append(f"{expected_label}: {value_fmt.format(expected)}")
+            rows.append(f"Surprise: {surprise_fmt.format(actual - expected)}")
+        text.append("<br>".join(rows))
+    return text
 
 st.set_page_config(
     page_title="Macro Dashboard",
@@ -170,8 +201,11 @@ if refresh_col.button("↻", help="Clear the FRED and news cache, then reload", 
     st.cache_data.clear()
     st.rerun()
 
-rates_tab, change_tab, credit_tab, inflation_tab, news_tab = st.tabs(
-    ["Rates", "Rate Change", "Credit", "Inflation", "News"]
+(
+    rates_tab, calendar_tab, change_tab, credit_tab,
+    inflation_tab, labor_tab, news_tab,
+) = st.tabs(
+    ["Rates", "Calendar", "Rate Change", "Credit", "Inflation", "Labor", "News"]
 )
 
 # ========================================================================
@@ -307,6 +341,45 @@ with rates_tab:
         st.dataframe(df.sort_index(ascending=False), width="stretch")
 
 # ========================================================================
+# Calendar tab
+# ========================================================================
+with calendar_tab:
+    st.subheader("US economic calendar")
+    schedule = release_calendar(days=45)
+    if not schedule:
+        st.caption("Nothing scheduled in the next 45 days.")
+    else:
+        cal_df = pd.DataFrame(
+            {
+                "Date": [it["date"].strftime("%a %b %d") for it in schedule],
+                "Time (ET)": [it["time_et"] for it in schedule],
+                "Event": [it["event"] for it in schedule],
+            }
+        )
+        # dim the routine weekly claims print; keep the monthly / FOMC events loud
+        def _cal_row_style(row):
+            dim = row["Event"] == "Initial jobless claims"
+            return [f"color: {'#8a8a8a' if dim else '#d0d0d0'}"] * len(row)
+
+        st.table(
+            cal_df.style
+            .apply(_cal_row_style, axis=1)
+            .set_properties(**{"text-align": "left"})
+            .hide(axis="index")
+        )
+    st.caption(
+        "Regular release schedule (08:30 ET; FOMC 14:00 ET) — CPI/PPI/retail/PCE "
+        "days are the usual dates; confirm against the BLS / BEA / Census calendars."
+    )
+
+    st.subheader("Scheduled FOMC meetings")
+    fomc = fomc_meeting_dates()
+    if fomc:
+        st.markdown("\n".join(f"- {day:%A, %B %d, %Y}" for day in fomc))
+    else:
+        st.caption("No scheduled FOMC dates on file.")
+
+# ========================================================================
 # Credit tab
 # ========================================================================
 with credit_tab:
@@ -436,6 +509,9 @@ with inflation_tab:
         default=infl_labels, key="inflation_series", label_visibility="collapsed",
     )
     infl_range = _padded_range([infl[sid].dropna() for sid, _, _ in _INFLATION_SPEC])
+    nowcasts, nowcast_note = fetch_cpi_nowcasts()
+    # FRED id -> nowcast column: the Cleveland Fed feeds CPI and core CPI
+    _NOWCAST_COL = {"CPIAUCSL": "cpi_nowcast", "CPILFESL": "core_cpi_nowcast"}
 
     infl_fig = go.Figure()
     for series_id, label, colour in _INFLATION_SPEC:
@@ -444,9 +520,20 @@ with inflation_tab:
         # CPI/PCE are monthly; plot their own observation dates so the line
         # isn't broken by NaNs on the daily grid the breakeven series creates.
         s = infl[series_id].dropna()
+        extra = {}
+        if series_id in _NOWCAST_COL and _NOWCAST_COL[series_id] in nowcasts:
+            expected = nowcasts[_NOWCAST_COL[series_id]].reindex(s.index)
+            extra = dict(
+                hovertext=_consensus_hover(
+                    s.index, s.values, expected.values,
+                    header_fmt="%b %Y", value_fmt="{:.2f}%", surprise_fmt="{:+.2f} pp",
+                    expected_label="Nowcast",
+                ),
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
         infl_fig.add_trace(
             go.Scatter(x=s.index, y=s.values, name=label, mode="lines",
-                       line=dict(color=colour))
+                       line=dict(color=colour), **extra)
         )
     infl_yaxis = dict(title="Percent", ticksuffix="%")
     if infl_range:
@@ -455,15 +542,208 @@ with inflation_tab:
         height=480,
         margin=dict(l=52, r=14, t=10, b=28),
         showlegend=False,
+        hovermode="closest",   # per-point tooltip so the nowcast/surprise text shows
         yaxis=infl_yaxis,
         xaxis=dict(title=None),
     )
     theme.render_chart(infl_fig)
+    if nowcast_note:
+        st.caption(f"CPI nowcast unavailable — {nowcast_note}. Hover shows the actual only.")
+    else:
+        st.caption(
+            "Hover a CPI or Core CPI point for the Cleveland Fed nowcast, actual, "
+            "and surprise (YoY %)."
+        )
     if not infl_pick:
         st.caption("Select at least one series above.")
 
     with st.expander("Inflation data"):
         st.dataframe(infl.sort_index(ascending=False), width="stretch")
+
+# ========================================================================
+# Labor tab
+# ========================================================================
+with labor_tab:
+    try:
+        lab = fetch_labor(start_date.isoformat(), end_date.isoformat())
+    except FredAPIError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    if lab.dropna(how="all").empty:
+        st.warning("FRED returned no labor-market data.")
+        st.stop()
+
+    lo, hi = pd.Timestamp(start_date), pd.Timestamp(end_date)
+    payrolls_mom = lab["PAYEMS"].dropna().diff().dropna()            # thousands, MoM
+    unrate = lab["UNRATE"].dropna()
+    civpart = lab["CIVPART"].dropna()
+    icsa = lab["ICSA"].dropna()
+    ccsa = lab["CCSA"].dropna()
+    icsa_ma = icsa.rolling(4).mean()                                 # 4-week average
+    ahe_yoy = (lab["CES0500000003"].dropna().pct_change(12) * 100.0).dropna()
+
+    # --- metrics: latest reading + change vs the prior observation -------
+    m1, m2, m3, m4 = st.columns(4)
+    if len(payrolls_mom):
+        latest = payrolls_mom.iloc[-1]
+        m1.metric(
+            f"Payrolls, MoM — {payrolls_mom.index[-1]:%b %Y}",
+            f"{latest:+,.0f}k",
+            None if len(payrolls_mom) < 2 else f"{latest - payrolls_mom.iloc[-2]:+,.0f}k vs prior",
+            delta_color="normal",
+        )
+    else:
+        m1.metric("Payrolls, MoM", "n/a")
+
+    if len(unrate):
+        m2.metric(
+            f"Unemployment — {unrate.index[-1]:%b %Y}",
+            f"{unrate.iloc[-1]:.1f}%",
+            None if len(unrate) < 2 else f"{unrate.iloc[-1] - unrate.iloc[-2]:+.1f} pp vs prior",
+            delta_color="inverse",
+        )
+    else:
+        m2.metric("Unemployment", "n/a")
+
+    if len(icsa):
+        m3.metric(
+            f"Initial claims — {icsa.index[-1]:%b %d}",
+            f"{icsa.iloc[-1]:,.0f}",
+            None if len(icsa) < 2 else f"{icsa.iloc[-1] - icsa.iloc[-2]:+,.0f} vs prior",
+            delta_color="inverse",
+        )
+    else:
+        m3.metric("Initial claims", "n/a")
+
+    if len(ahe_yoy):
+        m4.metric(
+            f"Avg hourly earnings, YoY — {ahe_yoy.index[-1]:%b %Y}",
+            f"{ahe_yoy.iloc[-1]:.1f}%",
+            None if len(ahe_yoy) < 2 else f"{ahe_yoy.iloc[-1] - ahe_yoy.iloc[-2]:+.1f} pp vs prior",
+            delta_color="normal",
+        )
+    else:
+        m4.metric("Avg hourly earnings, YoY", "n/a")
+
+    # --- payrolls MoM change, as bars so single months read clearly ----
+    st.subheader("Nonfarm payrolls — month-over-month change")
+    mom_win = payrolls_mom.loc[lo:hi]
+    if mom_win.empty:
+        st.info("No payrolls data in the selected range.")
+    else:
+        nfp_forecasts, nfp_note = fetch_nfp_forecasts()
+        fc_win = nfp_forecasts.reindex(mom_win.index)
+
+        def _pay_hover(month, actual, forecast):
+            rows = [f"<b>{month:%b %Y}</b>", f"Actual: {actual:+,.0f}k"]
+            if pd.notna(forecast):
+                rows.append(f"Forecast: {forecast:+,.0f}k")
+            return "<br>".join(rows)
+
+        pay_fig = go.Figure(
+            go.Bar(
+                x=mom_win.index, y=mom_win.values, name="MoM change",
+                marker_color=[_GREEN if v >= 0 else _RED for v in mom_win.values],
+                text=[f"{v:+,.0f}" for v in mom_win.values],
+                textposition="outside",
+                textfont=dict(family=theme.MONO, size=9, color="#9a9a9a"),
+                cliponaxis=False,
+                hovertext=[
+                    _pay_hover(m, a, f)
+                    for m, a, f in zip(mom_win.index, mom_win.values, fc_win.values)
+                ],
+                hovertemplate="%{hovertext}<extra></extra>",
+            )
+        )
+        pay_fig.update_layout(
+            height=400, margin=dict(l=58, r=14, t=18, b=28), showlegend=False,
+            bargap=0.2, hovermode="closest",
+            yaxis=dict(title="Thousands of jobs", tickformat=",.0f",
+                       zeroline=True, zerolinecolor="#3a3a3a"),
+            xaxis=dict(title=None),
+        )
+        theme.render_chart(pay_fig)
+        if nfp_note:
+            st.caption(f"NFP forecast unavailable — {nfp_note}. Bars show the actual only.")
+
+    # --- unemployment and participation: separate small charts so each
+    #     reads on its own tight scale (together, UNRATE's moves vanish) -----
+    ur_labels = [label for label, _ in _LABOR_UR_SPEC]
+    ur_pick = st.pills(
+        "Unemployment series", ur_labels, selection_mode="multi",
+        default=ur_labels, key="labor_ur", label_visibility="collapsed",
+    )
+    _UR_COLOUR = dict(_LABOR_UR_SPEC)
+
+    def _rate_chart(title, series, colour):
+        window = series.loc[lo:hi]
+        st.subheader(title)
+        if window.empty:
+            st.info("No data in the selected range.")
+            return
+        rng = _padded_range([window], pad_frac=0.10)
+        fig = go.Figure(
+            go.Scatter(x=window.index, y=window.values, mode="lines",
+                       line=dict(color=colour),
+                       hovertemplate="<b>%{x|%b %Y}</b><br>%{y:.1f}%<extra></extra>")
+        )
+        yaxis = dict(title="Percent", ticksuffix="%", tickformat=".1f")
+        if rng:
+            yaxis["range"] = rng
+        fig.update_layout(height=250, margin=dict(l=52, r=14, t=8, b=24),
+                          showlegend=False, hovermode="closest",
+                          yaxis=yaxis, xaxis=dict(title=None))
+        theme.render_chart(fig)
+
+    if "Unemployment" in (ur_pick or []):
+        _rate_chart("Unemployment rate", unrate, _UR_COLOUR["Unemployment"])
+    if "Participation" in (ur_pick or []):
+        _rate_chart("Participation rate", civpart, _UR_COLOUR["Participation"])
+    if not ur_pick:
+        st.caption("Select at least one series above.")
+
+    # --- initial vs continuing claims, initial with a 4-week average ---
+    st.subheader("Jobless claims")
+    claims_labels = [label for label, _, _ in _CLAIMS_SPEC]
+    claims_pick = st.pills(
+        "Claims series", claims_labels, selection_mode="multi",
+        default=claims_labels, key="labor_claims", label_visibility="collapsed",
+    )
+    claims_data = {
+        "Initial claims": icsa.loc[lo:hi],
+        "Initial 4wk avg": icsa_ma.loc[lo:hi],
+        "Continuing claims": ccsa.loc[lo:hi],
+    }
+    claims_left = _padded_range([claims_data["Initial claims"], claims_data["Initial 4wk avg"]])
+    claims_right = _padded_range([claims_data["Continuing claims"]])
+    claims_fig = make_subplots(specs=[[{"secondary_y": True}]])
+    for label, colour, on_secondary in _CLAIMS_SPEC:
+        if label not in (claims_pick or []):
+            continue
+        s = claims_data[label]
+        claims_fig.add_trace(
+            go.Scatter(x=s.index, y=s.values, name=label, mode="lines",
+                       line=dict(color=colour, width=2.2 if label == "Initial 4wk avg" else 1.3)),
+            secondary_y=on_secondary,
+        )
+    claims_fig.update_layout(height=420, margin=dict(l=64, r=64, t=10, b=28), showlegend=False)
+    claims_fig.update_xaxes(title=None)
+    claims_fig.update_yaxes(title_text="Initial claims", tickformat=",.0f", color="#cf9038",
+                            secondary_y=False, **({"range": claims_left} if claims_left else {}))
+    claims_fig.update_yaxes(title_text="Continuing claims", tickformat=",.0f", color="#7f8fbf",
+                            showgrid=False, secondary_y=True,
+                            **({"range": claims_right} if claims_right else {}))
+    theme.render_chart(claims_fig)
+    st.caption(
+        "Weekly, seasonally adjusted · the 4-week average smooths the noisy "
+        "initial-claims series."
+    )
+    if not claims_pick:
+        st.caption("Select at least one series above.")
+
+    with st.expander("Labor data"):
+        st.dataframe(lab.loc[lo:hi].sort_index(ascending=False), width="stretch")
 
 # ========================================================================
 # News tab
