@@ -43,8 +43,19 @@ Tabs, in order: **Rates · Calendar · Rate Change · Credit · Inflation · Lab
 - **FRED** (`FRED_API_KEY`). Publication lag is normal, not staleness:
   DGS/H.15 daily series run ~1 business day behind; CPI/PCE/payrolls are monthly
   and weeks behind by design. `release_overdue()` only flags a series once its
-  *next scheduled* release has passed. Inflation YoY uses `CPIAUCSL` (SA) —
-  slight methodology mismatch vs the NSA-based nowcast.
+  *next scheduled* release has passed. Inflation YoY uses `CPIAUCNS` /
+  `CPILFENS` (NSA) — BLS's own convention for 12-month changes, matching the
+  NSA-based Cleveland Fed nowcast. YoY is computed by calendar-month offset
+  (`data.yoy_change`), not row offset, so a missed release — e.g. CPI's
+  October 2025 government-shutdown gap — can't misalign the 12-month lookback
+  (this bit us once: SA + row-offset showed 3.71% for Aug 2026 vs BLS's
+  3.4%). Any other YoY calc (e.g. labor's AHE) should go through the same
+  helper for the same reason — audited both, plus core CPI and core PCE,
+  against the actual Aug 2026 releases (3.4% headline / 2.4% core CPI, 3.1%
+  AHE all matched). Core PCE (`PCEPILFE`) deliberately stays SA, not NSA like
+  CPI: BEA doesn't publish a monthly NSA core-PCE index at all, and BEA's own
+  headline YoY is itself computed off the SA index (confirmed: our 3.34% vs
+  BEA's reported 3.3% for Jul 2026).
 - **ICE BofA OAS** (`BAMLH0A0HYM2` HY, `BAMLC0A0CM` IG, via FRED). Redistribution
   is restricted by ICE's terms — fine for a personal dashboard, do not
   republish the raw series or expose a bulk data export.
@@ -62,8 +73,15 @@ Tabs, in order: **Rates · Calendar · Rate Change · Credit · Inflation · Lab
   forecast/actual pairs are as-published, never revised. The payroll-bar tooltip
   pairs this forecast with the bar's own (FRED, revised) actual — forecast only,
   no surprise math. Missing forecast or a scrape failure → actual alone.
-- **Kalshi** — no auth for market data. Series ticker `KXFEDDECISION` hardcoded
-  with a category-scan discovery fallback.
+- **Kalshi** — no auth for market data. The *series* ticker `KXFEDDECISION` is
+  hardcoded (with a category-scan discovery fallback) — that's stable across
+  every meeting, not tied to one. Which *meeting* shows is dynamic: markets
+  are always queried `status=open`, and a resolved meeting's markets drop out
+  of that filter entirely (verified against the real Jul 29, 2026 decision —
+  empty list, not stale prices or an error), so the next 2 meetings roll
+  forward automatically with no code change needed per FOMC date. A "nothing
+  to show" state (no series found, API down, no open/upcoming markets) always
+  surfaces as a `⚠️` caption in the Rates tab, never a silent blank.
 - **News** — Treasury.gov has no working RSS (uses a Google News `site:` search);
   "NY Fed" is the Liberty Street Economics feed.
 
@@ -79,9 +97,11 @@ Tabs, in order: **Rates · Calendar · Rate Change · Credit · Inflation · Lab
 
 ## Outstanding
 
-- `release_calendar` uses approximate day-of-month anchors (CPI 12th, PPI 13th,
-  retail 16th, PCE 27th) — not the exact BLS/BEA/Census published dates. Fine as
-  a "regular schedule"; swap in a real hardcoded table if precision matters.
+- `release_calendar`'s hardcoded CPI/PPI/payrolls/retail/PCE dates
+  (`_RELEASE_DATES` in `data.py`) only cover CY2026 — OMB hasn't published the
+  CY2027 schedule yet as of Sep 2026. Extend the table once it does (usually
+  posted each fall at whitehouse.gov); until then, a release past Dec 2026
+  just won't appear rather than guess at a date.
 - Cleveland Fed nowcast fetch is a 7 MB scrape with no lighter endpoint; a
   format change on their side breaks it silently (falls back to actual-only).
 - Labor tab shows a 4th metric (AHE YoY) beyond the spec's 3 — leave or move.

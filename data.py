@@ -69,9 +69,13 @@ TENOR_YEARS: dict[str, float] = {
 
 # Inflation series -> label. CPI/core-CPI/core-PCE are published as index levels
 # and shown as year-over-year % change; T10YIE is already an annualised rate.
+# Headline and core CPI use the *not seasonally adjusted* index (BLS's own
+# convention for 12-month changes — see fetch_inflation); CPIAUCSL/CPILFESL
+# (SA) are reserved for a month-over-month comparison, which this dashboard
+# doesn't currently show.
 INFLATION_SERIES: dict[str, str] = {
-    "CPIAUCSL": "CPI (headline, YoY)",
-    "CPILFESL": "Core CPI (YoY)",
+    "CPIAUCNS": "CPI (headline, YoY)",
+    "CPILFENS": "Core CPI (YoY)",
     "PCEPILFE": "Core PCE (YoY)",
     "T10YIE": "10Y breakeven",
 }
@@ -79,7 +83,7 @@ INFLATION_SERIES: dict[str, str] = {
 # Native release frequency: "D" daily (business days), "M" monthly.
 SERIES_FREQ: dict[str, str] = {
     "DGS3MO": "D", "DGS2": "D", "DGS5": "D", "DGS10": "D", "DGS30": "D",
-    "CPIAUCSL": "M", "PCEPILFE": "M", "T10YIE": "D",
+    "CPIAUCNS": "M", "PCEPILFE": "M", "T10YIE": "D",
 }
 
 # Labor-market series. PAYEMS/CES0500000003 are levels (thousands of jobs,
@@ -172,9 +176,50 @@ def fetch_treasury_yields(start_date: str, end_date: str) -> pd.DataFrame:
     return frame.sort_index()
 
 
+def yoy_change(series: pd.Series, freq: str = "MS") -> pd.Series:
+    """Year-over-year % change for a monthly level series, by calendar-month
+    offset rather than row offset.
+
+    Pure. ``series`` is a raw (levels) series with NaNs already dropped, as
+    :func:`fetch_series` returns. FRED reports a missed release as ``"."``,
+    which ``fetch_series`` drops — e.g. CPI's October 2025 print, delayed past
+    publication by that month's government shutdown, never lands as a row.
+    ``pd.Series.pct_change(12)`` counts *rows*, not months: once a row is
+    missing, "12 rows back" no longer lands on the same calendar month a year
+    prior, and every YoY value from that point on is wrong. Reindexing to a
+    complete monthly grid first (the missing month becomes an explicit NaN)
+    makes a 12-row shift equal to a 12-month shift again, so the comparison
+    always lands on the correct month regardless of gaps in between.
+    """
+    s = series.dropna().sort_index()
+    if s.empty:
+        return s
+    full = s.reindex(pd.date_range(s.index.min(), s.index.max(), freq=freq))
+    return ((full / full.shift(12) - 1) * 100.0).dropna()
+
+
 @st.cache_data(ttl=_CACHE_TTL, show_spinner="Fetching inflation data from FRED…")
 def fetch_inflation(start_date: str, end_date: str) -> pd.DataFrame:
     """CPI, core CPI & core PCE as YoY %, plus the 10Y breakeven rate (already %).
+
+    Headline and core CPI use the *not seasonally adjusted* index (CPIAUCNS /
+    CPILFENS) for the 12-month change — BLS's own convention (a 12-month
+    comparison already nets out seasonality, so the NSA index is what BLS's
+    news release reports as the headline YoY figure — confirmed against the
+    Aug 2026 release: 3.4% headline, 2.4% core, both matching this function's
+    output); the SA index (CPIAUCSL/CPILFESL) is reserved for a
+    month-over-month comparison, not computed here.
+
+    Core PCE stays on PCEPILFE (SA) deliberately, not the NSA/CPI pattern:
+    BEA doesn't publish a monthly NSA core-PCE price index at all (checked
+    FRED — only annual/quarterly NSA variants exist), and BEA's own headline
+    YoY figure is itself computed from the SA index, so there is no NSA
+    series to switch to here.
+
+    Every column's YoY is computed with :func:`yoy_change` (calendar-month
+    offset, not row offset), so a gap in the source series — e.g. the CPI
+    series' October 2025 shutdown gap — can't shift the 12-month lookback
+    onto the wrong month.
 
     The index series come as levels, so ~13 extra months are fetched before
     ``start_date`` to seed the trailing-12-month change; the result is then
@@ -182,16 +227,16 @@ def fetch_inflation(start_date: str, end_date: str) -> pd.DataFrame:
     """
     lookback = (pd.Timestamp(start_date) - pd.DateOffset(months=13)).strftime("%Y-%m-%d")
 
-    cpi = fetch_series("CPIAUCSL", lookback, end_date)
-    core_cpi = fetch_series("CPILFESL", lookback, end_date)
+    cpi = fetch_series("CPIAUCNS", lookback, end_date)
+    core_cpi = fetch_series("CPILFENS", lookback, end_date)
     pce = fetch_series("PCEPILFE", lookback, end_date)
     breakeven = fetch_series("T10YIE", lookback, end_date)
 
     frame = pd.DataFrame(
         {
-            "CPIAUCSL": cpi.pct_change(12) * 100.0,
-            "CPILFESL": core_cpi.pct_change(12) * 100.0,
-            "PCEPILFE": pce.pct_change(12) * 100.0,
+            "CPIAUCNS": yoy_change(cpi),
+            "CPILFENS": yoy_change(core_cpi),
+            "PCEPILFE": yoy_change(pce),
             "T10YIE": breakeven,
         }
     )
@@ -366,28 +411,56 @@ def fetch_nfp_forecasts() -> tuple[pd.Series, str | None]:
     return series, None
 
 
-# Recurring US data-release schedule. These series publish on fixed patterns;
-# day-of-month anchors below are the usual release day (verify exact dates
-# against the BLS / BEA / Census calendars). Everything is 08:30 ET.
-_MONTHLY_RELEASES = (
-    (12, "CPI"),
-    (13, "PPI"),
-    (16, "Retail sales"),
-    (27, "Personal income & outlays (PCE)"),
-)
-
-
-def _shift_off_weekend(day: pd.Timestamp) -> pd.Timestamp:
-    """Push a Sat/Sun onto the following Monday (agencies don't release then)."""
-    return day + pd.Timedelta(days={5: 2, 6: 1}.get(day.weekday(), 0))
+# Actual published US data-release dates — CPI, PPI, the Employment Situation,
+# Retail Sales and Personal Income & Outlays (PCE) all move around by a few
+# days each month (and dodge holidays: e.g. Columbus Day pushed Oct 2026 CPI
+# from the 12th to the 14th), so a day-of-month anchor drifts wrong most
+# months. These come from OMB/OIRA's annual "Schedule of Release Dates for
+# Principal Federal Economic Indicators" (e.g.
+# https://www.whitehouse.gov/wp-content/uploads/2025/09/pfei_schedule_release_dates_cy2026.pdf),
+# cross-checked against BLS (CPI/PPI/Employment Situation), Census (Retail
+# Sales) and BEA (Personal Income & Outlays). Covers CY2026 only — extend with
+# CY2027 once OMB publishes that schedule (typically each fall); until then a
+# release past December 2026 simply won't appear rather than guess at a date.
+# Everything here releases at 08:30 ET.
+_RELEASE_DATES: dict[str, tuple[str, ...]] = {
+    "CPI": (
+        "2026-01-13", "2026-02-11", "2026-03-11", "2026-04-10", "2026-05-12",
+        "2026-06-10", "2026-07-14", "2026-08-12", "2026-09-11", "2026-10-14",
+        "2026-11-10", "2026-12-10",
+    ),
+    "PPI": (
+        "2026-01-14", "2026-02-12", "2026-03-12", "2026-04-14", "2026-05-13",
+        "2026-06-11", "2026-07-15", "2026-08-13", "2026-09-10", "2026-10-15",
+        "2026-11-13", "2026-12-15",
+    ),
+    "Employment situation (payrolls)": (
+        "2026-01-09", "2026-02-06", "2026-03-06", "2026-04-03", "2026-05-08",
+        "2026-06-05", "2026-07-02", "2026-08-07", "2026-09-04", "2026-10-02",
+        "2026-11-06", "2026-12-04",
+    ),
+    "Retail sales": (
+        "2026-01-15", "2026-02-17", "2026-03-16", "2026-04-16", "2026-05-14",
+        "2026-06-17", "2026-07-16", "2026-08-14", "2026-09-16", "2026-10-15",
+        "2026-11-17", "2026-12-16",
+    ),
+    "Personal income & outlays (PCE)": (
+        "2026-01-29", "2026-02-26", "2026-03-27", "2026-04-30", "2026-05-28",
+        "2026-06-25", "2026-07-30", "2026-08-26", "2026-09-30", "2026-10-29",
+        "2026-11-25", "2026-12-23",
+    ),
+}
 
 
 def release_calendar(days: int = 45) -> list[dict]:
     """Scheduled US releases over the next ``days`` days, sorted by date.
 
     Pure — no network. Each item: ``{"date": Timestamp, "time_et": "HH:MM",
-    "event": str}``. Covers CPI, PPI, payrolls, PCE, jobless claims and retail
-    sales (fixed schedules) plus scheduled FOMC decisions.
+    "event": str}``. Covers CPI, PPI, payrolls, PCE and retail sales (hardcoded
+    published dates, :data:`_RELEASE_DATES`), jobless claims (fixed weekly
+    cadence, safe to generate) and scheduled FOMC decisions. Every date is
+    compared against today, so a release already past never appears — only
+    ``today <= date <= today + days`` makes the list.
     """
     today = pd.Timestamp.today().normalize()
     end = today + pd.Timedelta(days=days)
@@ -399,17 +472,12 @@ def release_calendar(days: int = 45) -> list[dict]:
         items.append({"date": thursday, "time_et": "08:30", "event": "Initial jobless claims"})
         thursday += pd.Timedelta(days=7)
 
-    for month_start in pd.date_range(today.replace(day=1), end + pd.Timedelta(days=31), freq="MS"):
-        # Employment Situation (payrolls & unemployment) — first Friday.
-        first_friday = month_start + pd.Timedelta(days=(4 - month_start.weekday()) % 7)
-        if today <= first_friday <= end:
-            items.append({"date": first_friday, "time_et": "08:30",
-                          "event": "Employment situation (payrolls)"})
-        # Monthly indicators, anchored to their usual day of month.
-        for day_of_month, name in _MONTHLY_RELEASES:
-            when = _shift_off_weekend(month_start + pd.Timedelta(days=day_of_month - 1))
+    # CPI, PPI, Employment Situation, Retail Sales, PCE — published dates.
+    for event, dates in _RELEASE_DATES.items():
+        for date_str in dates:
+            when = pd.Timestamp(date_str)
             if today <= when <= end:
-                items.append({"date": when, "time_et": "08:30", "event": name})
+                items.append({"date": when, "time_et": "08:30", "event": event})
 
     # Scheduled FOMC decisions in the window (announcement at 14:00 ET).
     for day in fomc_meeting_dates(within_days=days):

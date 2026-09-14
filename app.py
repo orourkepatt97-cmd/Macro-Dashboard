@@ -39,6 +39,7 @@ from data import (
     release_calendar,
     release_overdue,
     spread,
+    yoy_change,
 )
 
 # Sign colouring shared by the Rate Change and Credit tables.
@@ -71,8 +72,8 @@ _CREDIT_SPEC = [                      # (label, colour, on secondary axis)
     ("2s10s", "#7f8fbf", True),
 ]
 _INFLATION_SPEC = [                   # (FRED id, label, colour)
-    ("CPIAUCSL", "CPI", "#cf9038"),
-    ("CPILFESL", "Core CPI", "#e05252"),
+    ("CPIAUCNS", "CPI", "#cf9038"),
+    ("CPILFENS", "Core CPI", "#e05252"),
     ("PCEPILFE", "Core PCE", "#d0d0d0"),
     ("T10YIE", "10Y breakeven", "#7f8fbf"),
 ]
@@ -182,7 +183,7 @@ def _asof_line(asof: dict) -> str:
             f"Rates as of {when:%b %d}" + (" (late)" if release_overdue(rep, when) else "")
         )
 
-    for series_id, name in (("CPIAUCSL", "CPI"), ("PCEPILFE", "PCE")):
+    for series_id, name in (("CPIAUCNS", "CPI"), ("PCEPILFE", "PCE")):
         when = asof.get(series_id)
         if when is None:
             parts.append(f"{name} n/a")
@@ -368,8 +369,9 @@ with calendar_tab:
             .hide(axis="index")
         )
     st.caption(
-        "Regular release schedule (08:30 ET; FOMC 14:00 ET) — CPI/PPI/retail/PCE "
-        "days are the usual dates; confirm against the BLS / BEA / Census calendars."
+        "CPI/PPI/payrolls/retail/PCE dates are OMB's published CY2026 release "
+        "schedule (08:30 ET), cross-checked against BLS/Census/BEA; jobless "
+        "claims are the fixed weekly Thursday cadence; FOMC at 14:00 ET."
     )
 
     st.subheader("Scheduled FOMC meetings")
@@ -511,7 +513,7 @@ with inflation_tab:
     infl_range = _padded_range([infl[sid].dropna() for sid, _, _ in _INFLATION_SPEC])
     nowcasts, nowcast_note = fetch_cpi_nowcasts()
     # FRED id -> nowcast column: the Cleveland Fed feeds CPI and core CPI
-    _NOWCAST_COL = {"CPIAUCSL": "cpi_nowcast", "CPILFESL": "core_cpi_nowcast"}
+    _NOWCAST_COL = {"CPIAUCNS": "cpi_nowcast", "CPILFENS": "core_cpi_nowcast"}
 
     infl_fig = go.Figure()
     for series_id, label, colour in _INFLATION_SPEC:
@@ -581,7 +583,7 @@ with labor_tab:
     icsa = lab["ICSA"].dropna()
     ccsa = lab["CCSA"].dropna()
     icsa_ma = icsa.rolling(4).mean()                                 # 4-week average
-    ahe_yoy = (lab["CES0500000003"].dropna().pct_change(12) * 100.0).dropna()
+    ahe_yoy = yoy_change(lab["CES0500000003"])
 
     # --- metrics: latest reading + change vs the prior observation -------
     m1, m2, m3, m4 = st.columns(4)

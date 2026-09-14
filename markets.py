@@ -1,9 +1,19 @@
 """Kalshi Fed-decision prediction markets.
 
 Public market data only — the ``api.elections.kalshi.com`` REST API needs no
-auth for reads. One 15-minute cached call. Any failure (network, HTTP error,
+auth for reads. One 5-minute cached call. Any failure (network, HTTP error,
 unexpected JSON) returns an empty frame plus a short note, so the UI degrades
 gracefully instead of raising.
+
+Rolling forward across meetings: ``_all_markets()`` always queries
+``status="open"``, and a meeting's markets stop being "open" the moment Kalshi
+settles them — confirmed directly against the real, already-resolved Jul 29,
+2026 FOMC event, which comes back as an empty ``markets`` list (not an error,
+not stale settled prices) for that filter. So a resolved meeting simply drops
+out of the pool ``fed_decision_markets()`` groups and sorts by
+``event_ticker``/close time; nothing here is pinned to one meeting's ticker,
+and no special handling is needed when a decision lands — the next call just
+returns the next two meetings.
 """
 
 from __future__ import annotations
