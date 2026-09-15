@@ -44,7 +44,8 @@ from data import (
     yoy_change,
 )
 
-# Sign colouring shared by the Rate Change and Credit tables.
+# Shared green/red palette: sign colouring on the Rate Change table, payroll
+# bars, and the header's validation status line.
 _GREEN, _RED = "#3fb950", "#f85149"
 
 
@@ -242,10 +243,10 @@ else:
     st.caption(_val_text)
 
 (
-    rates_tab, calendar_tab, change_tab, credit_tab,
+    rates_tab, calendar_tab, credit_tab,
     inflation_tab, labor_tab, news_tab,
 ) = st.tabs(
-    ["Rates", "Calendar", "Rate Change", "Credit", "Inflation", "Labor", "News"]
+    ["Rates", "Calendar", "Credit", "Inflation", "Labor", "News"]
 )
 
 # ========================================================================
@@ -325,6 +326,34 @@ with rates_tab:
             showlegend=False,  # the colour-tinted tenor pills above are the legend
         )
         theme.render_chart(ts_fig)
+
+    # --- Rate Change ----------------------------------------------------
+    st.subheader("Rate Change")
+    try:
+        hist = fetch_change_window()
+    except FredAPIError as exc:
+        st.error(str(exc))
+        st.stop()
+
+    if hist.dropna(how="all").empty:
+        st.warning("FRED returned no yield history for the movement table.")
+        st.stop()
+
+    tbl = movement_table(hist)
+    change_cols = [c for c in tbl.columns if c != "Level"]
+
+    number_formats = {"Level": "{:.2f}", **{col: "{:+.1f}" for col in change_cols}}
+    styled = (
+        tbl.style
+        .format(number_formats, na_rep="–")
+        .map(_sign_color, subset=change_cols)
+        .set_properties(**{"text-align": "right"})  # header alignment is in theme.py
+    )
+    st.table(styled)
+    st.caption(
+        "Level in percent (2dp) · changes in basis points (1dp) vs. the last "
+        "observation on or before each lookback date."
+    )
 
     # --- Yield curve: today vs 1M / 1Y ago ---------------------------
     st.subheader("Yield curve — today vs 1 month and 1 year ago")
@@ -836,33 +865,3 @@ with news_tab:
             text_col.caption(f"{item['source']}  ·  {when}")
             if item["summary"]:
                 text_col.write(item["summary"])
-
-# ========================================================================
-# Change tab
-# ========================================================================
-with change_tab:
-    try:
-        hist = fetch_change_window()
-    except FredAPIError as exc:
-        st.error(str(exc))
-        st.stop()
-
-    if hist.dropna(how="all").empty:
-        st.warning("FRED returned no yield history for the movement table.")
-        st.stop()
-
-    tbl = movement_table(hist)
-    change_cols = [c for c in tbl.columns if c != "Level"]
-
-    number_formats = {"Level": "{:.2f}", **{col: "{:+.1f}" for col in change_cols}}
-    styled = (
-        tbl.style
-        .format(number_formats, na_rep="–")
-        .map(_sign_color, subset=change_cols)
-        .set_properties(**{"text-align": "right"})  # header alignment is in theme.py
-    )
-    st.table(styled)
-    st.caption(
-        "Level in percent (2dp) · changes in basis points (1dp) vs. the last "
-        "observation on or before each lookback date."
-    )

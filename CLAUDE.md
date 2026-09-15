@@ -41,7 +41,9 @@ cron, a GitHub Action, or Streamlit-side).
 | `markets.py` | Kalshi Fed-decision markets (public REST, no auth). 5-min cache. Returns `(frame, note, fetched_at)`; any failure → empty frame + note. |
 | `theme.py` | Terminal styling: global CSS injected via `st.markdown`, the shared Plotly template (`bloomberg`), `TENOR_LINE` per-tenor line styles, `_PILL_TINTS` (pill-underline colours, must match the `_*_SPEC` colour lists in `app.py`), `render_chart()`. |
 
-Tabs, in order: **Rates · Calendar · Rate Change · Credit · Inflation · Labor · News**.
+Tabs, in order: **Rates · Calendar · Credit · Inflation · Labor · News**. Rate
+Change is no longer its own tab — it's a section inside Rates, between
+"Yields over time" and the yield-curve snapshot chart.
 
 ## UI conventions
 
