@@ -4,6 +4,33 @@ Streamlit macro dashboard: US rates/curve, curve-change table, credit spreads,
 inflation, labor, an economic calendar, Fed-decision odds, and market news.
 Run: `streamlit run app.py` (needs `FRED_API_KEY`; see below).
 
+`python validate.py` (`--quiet` for cron/CI use) independently audits the data
+pipeline against the sources themselves — no hardcoded expected values, every
+threshold is either a generic per-frequency policy or derived from a series'
+own history. Checks: series resolve + no gaps + freshness (via FRED's own
+`last_updated`, not observation-date age — see the comment in `audit_series`
+for why that distinction matters); every YoY/spread/rolling-average value
+re-derived independently and compared to what `data.py`/`app.py` compute;
+FRED's DGS yields cross-checked against the Fed's own H.15 release; Kalshi
+outcome probabilities summing near 100%; latest values/moves outside the
+series' own 10-year range or 5σ. Exits non-zero on any failure. A gap
+matching a declared, verified entry in `_KNOWN_GAPS` (currently: the real Oct
+2025 CPI-family shutdown gap — see the FRED quirk note below) reports KNOWN
+instead of FAIL and doesn't affect the exit code, but is still listed every
+run in its own "Known exceptions" section (always printed, `--quiet`
+included) so it can't quietly turn into a FAIL you've learned to ignore. As
+of this writing: 122/122 passed, 4 known exceptions.
+
+Every run writes `validate_status.json` next to the script (gitignored —
+`data.validation_status()` reads it, with no error if it's missing). The
+dashboard header shows a small status line from it: green "Validation
+passed…" when the last run was clean, red "Validation FAILED — <check
+name>…" naming the first failing check when it wasn't, or a muted "no run
+recorded yet" if validate.py has never run in this environment (e.g. a fresh
+Streamlit Cloud deploy with no scheduled job wired up to run it yet — nothing
+currently runs validate.py on a schedule; that's on you to set up, whether
+cron, a GitHub Action, or Streamlit-side).
+
 ## Modules
 
 | File | Responsibility |

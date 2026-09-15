@@ -2,3 +2,4 @@
 .streamlit/secrets.toml
 venv/
 __pycache__/
+validate_status.json

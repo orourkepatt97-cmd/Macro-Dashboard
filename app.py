@@ -6,6 +6,7 @@ here comes from ``data.py``.
 
 from __future__ import annotations
 
+import html
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,7 @@ from data import (
     release_calendar,
     release_overdue,
     spread,
+    validation_status,
     yoy_change,
 )
 
@@ -201,6 +203,43 @@ asof_col.caption(_asof_line(latest_observations()))
 if refresh_col.button("↻", help="Clear the FRED and news cache, then reload", key="refresh_data"):
     st.cache_data.clear()
     st.rerun()
+
+
+# --- validate.py status line --------------------------------------------
+def _validation_line(status: dict | None) -> tuple[str, str | None]:
+    """(text, colour) for the header's validation status line. ``colour`` is
+    ``None`` for the muted default (validate.py has never run in this
+    environment — e.g. a fresh Streamlit Cloud deploy with no scheduled job
+    wired up yet), ``_GREEN`` for a clean last run, ``_RED`` naming the first
+    failing check when the last run found a real problem."""
+    if not isinstance(status, dict):
+        return "Validation: no run recorded yet", None
+
+    run_at = status.get("run_at")
+    try:
+        when = _et(datetime.fromisoformat(run_at), "%b %d, %H:%M") if run_at else "unknown time"
+    except (TypeError, ValueError):
+        when = "unknown time"
+
+    if status.get("failed"):
+        names = status.get("failing_checks") or []
+        first = names[0] if names else "unnamed check"
+        extra = f" (+{len(names) - 1} more)" if len(names) > 1 else ""
+        return f"Validation FAILED as of {when} — {first}{extra}", _RED
+
+    passed, known = status.get("passed", 0), status.get("known", 0)
+    known_note = f", {known} known" if known else ""
+    return f"Validation passed as of {when} ({passed} checks{known_note})", _GREEN
+
+
+_val_text, _val_color = _validation_line(validation_status())
+if _val_color:
+    st.caption(
+        f"<span style='color:{_val_color}'>●</span> {html.escape(_val_text)}",
+        unsafe_allow_html=True,
+    )
+else:
+    st.caption(_val_text)
 
 (
     rates_tab, calendar_tab, change_tab, credit_tab,

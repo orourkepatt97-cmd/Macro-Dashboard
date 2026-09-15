@@ -7,8 +7,10 @@ directly.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -741,3 +743,29 @@ def latest_change(series: pd.Series) -> tuple[pd.Timestamp, float, float | None]
 
     change_bps = (series.iloc[-1] - series.iloc[-2]) * 100.0
     return as_of, level, round(float(change_bps), 1)
+
+
+# Written by validate.py at the end of every run, next to that script (so it
+# lands here regardless of what directory it was invoked from).
+_VALIDATE_STATUS_PATH = Path(__file__).resolve().parent / "validate_status.json"
+
+
+def validation_status() -> dict | None:
+    """The most recent ``validate.py`` run, or ``None`` if it has never run in
+    this environment (file missing) or the file is unreadable/malformed.
+
+    Not cached — this is a few hundred bytes of local disk I/O, cheap enough
+    to read fresh on every rerun so the header reflects a validation run that
+    just landed without waiting out a cache TTL. Expected shape (written by
+    validate.py's ``write_status()``): ``{"run_at": iso8601 str, "passed":
+    int, "failed": int, "known": int, "ok": bool, "failing_checks": [str]}``.
+    """
+    try:
+        raw = _VALIDATE_STATUS_PATH.read_text()
+    except OSError:
+        return None
+    try:
+        status = json.loads(raw)
+    except ValueError:
+        return None
+    return status if isinstance(status, dict) else None

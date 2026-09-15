@@ -1,0 +1,27 @@
+name: Validate data pipeline
+
+"on":
+  schedule:
+    # Mondays 21:30 UTC = 5:30pm ET, after the Fed's 4:15pm ET H.15 release
+    # so Treasury data is same-day. Note: cron is fixed UTC and doesn't shift
+    # for daylight saving, so this lands at 4:30pm ET instead during EST
+    # (~Nov-Mar) — still after H.15, just an hour earlier than in EDT.
+    - cron: "30 21 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run validate.py
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python validate.py --quiet
