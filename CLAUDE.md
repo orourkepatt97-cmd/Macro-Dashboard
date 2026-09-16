@@ -26,10 +26,23 @@ Every run writes `validate_status.json` next to the script (gitignored —
 dashboard header shows a small status line from it: green "Validation
 passed…" when the last run was clean, red "Validation FAILED — <check
 name>…" naming the first failing check when it wasn't, or a muted "no run
-recorded yet" if validate.py has never run in this environment (e.g. a fresh
-Streamlit Cloud deploy with no scheduled job wired up to run it yet — nothing
-currently runs validate.py on a schedule; that's on you to set up, whether
-cron, a GitHub Action, or Streamlit-side).
+recorded yet" if validate.py has never run in this environment.
+
+`.github/workflows/validate.yml` runs it weekly (Mondays 21:30 UTC, after the
+Fed's 4:15pm ET H.15 release) plus on `workflow_dispatch` for a manual run
+from the Actions tab, using the `FRED_API_KEY` repo secret. After the run
+(pass or fail) it commits `validate_status.json` back to the repo as
+`github-actions[bot]` (`chore: update validation status [skip ci]`, skipped
+when the file is unchanged) and pushes to the branch that triggered it,
+*then* fails the job if `validate.py` found problems — in that order, so a
+failing run still gets its status committed before the workflow goes red.
+`validate_status.json` is tracked in git (no longer gitignored) specifically
+so this push reaches Streamlit Cloud's own checkout on its next deploy, which
+is what lets the header reflect it. Needs `permissions: contents: write` on
+the workflow, which it has. One bootstrap note: the file only exists in the
+repo after this workflow has actually run at least once post-merge (scheduled
+or manual) — until then the header still reads "no run recorded yet", same
+as any environment where validate.py hasn't run.
 
 ## Modules
 
@@ -131,8 +144,14 @@ Change is no longer its own tab — it's a section inside Rates, between
   CY2027 schedule yet as of Sep 2026. Extend the table once it does (usually
   posted each fall at whitehouse.gov); until then, a release past Dec 2026
   just won't appear rather than guess at a date.
-- Cleveland Fed nowcast fetch is a 7 MB scrape with no lighter endpoint; a
-  format change on their side breaks it silently (falls back to actual-only).
+- Cleveland Fed nowcast fetch is a 7 MB scrape with no lighter endpoint — still
+  true, no lighter endpoint exists. What's fixed: a *total* format break
+  already returned a note; `_cleveland_nowcasts` (`data.py`) now also detects
+  the quieter partial breaks — headline or core coming back completely empty
+  while the other still has data (one seriesname changed, not both), and the
+  newest parsed vintage being >1 month old (recent vintages stopped parsing
+  while older ones still do) — and reports both while still keeping whatever
+  data did parse, rather than silently reporting success either way.
 - Labor tab shows a 4th metric (AHE YoY) beyond the spec's 3 — leave or move.
 - FOMC dates need a yearly refresh (`_FOMC_DECISION_DAYS` in `data.py`).
 - The dev/sandbox FRED data looked synthetic (implausible payroll prints); real

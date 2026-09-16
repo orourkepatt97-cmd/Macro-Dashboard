@@ -296,8 +296,23 @@ def _last_nowcast(points: list[dict] | None) -> float | None:
 
 def _cleveland_nowcasts() -> tuple[dict[pd.Timestamp, float], dict[pd.Timestamp, float], str | None]:
     """``(cpi, core_cpi, note)`` — Cleveland Fed year-over-year CPI and core-CPI
-    inflation nowcasts keyed by reference month. Empty dicts + ``note`` on any
-    failure (the feed is a ~7 MB JSON on clevelandfed.org, not FRED)."""
+    inflation nowcasts keyed by reference month. Empty dicts + ``note`` on a
+    total failure (the feed is a ~7 MB JSON on clevelandfed.org, not FRED).
+
+    A total failure (network, bad JSON, unexpected top-level shape, nothing at
+    all parses) always returns a note and empty dicts, as before. But a
+    subtler failure is worse and used to pass silently: if the Fed tweaks the
+    feed's *internal* schema (a seriesname, the "YYYY-M" subcaption format),
+    parsing doesn't necessarily break all at once — one skipped vintage or one
+    renamed series at a time — so ``cpi``/``core`` could come back non-empty
+    but one-sided or stale while this function reported success. Beyond the
+    all-or-nothing case, this now also flags (while still returning whatever
+    did parse, so a partial break doesn't throw away good data): headline or
+    core coming back completely empty while the other has data (that series'
+    name likely changed, not both), and the newest parsed vintage being more
+    than a month old (the feed updates every business day, so anything older
+    means recent vintages stopped parsing even though old ones still do).
+    """
     try:
         resp = requests.get(
             CLEVELAND_NOWCAST_URL,
@@ -333,6 +348,26 @@ def _cleveland_nowcasts() -> tuple[dict[pd.Timestamp, float], dict[pd.Timestamp,
 
     if not cpi and not core:
         return {}, {}, "Cleveland Fed nowcast feed had no CPI data"
+    if not cpi:
+        return cpi, core, (
+            "Cleveland Fed nowcast feed had no headline CPI data (core CPI parsed "
+            "fine, so likely just that one series' name changed)"
+        )
+    if not core:
+        return cpi, core, (
+            "Cleveland Fed nowcast feed had no core CPI data (headline CPI parsed "
+            "fine, so likely just that one series' name changed)"
+        )
+
+    latest_vintage = max(set(cpi) | set(core))
+    today = pd.Timestamp.today().normalize()
+    age_months = (today.year - latest_vintage.year) * 12 + (today.month - latest_vintage.month)
+    if age_months > 1:
+        return cpi, core, (
+            f"Cleveland Fed nowcast feed's newest parsed vintage is {latest_vintage:%b %Y} "
+            f"({age_months} months old) — recent vintages may have stopped parsing"
+        )
+
     return cpi, core, None
 
 
@@ -340,8 +375,11 @@ def _cleveland_nowcasts() -> tuple[dict[pd.Timestamp, float], dict[pd.Timestamp,
 def fetch_cpi_nowcasts() -> tuple[pd.DataFrame, str | None]:
     """``(frame, note)``. ``frame`` is indexed by reference month with columns
     ``cpi_nowcast`` and ``core_cpi_nowcast`` — the Cleveland Fed's year-over-year
-    inflation nowcasts, in percent. ``note`` explains a fetch failure (the frame
-    is then empty and the Inflation-tab tooltips fall back to actual-only)."""
+    inflation nowcasts, in percent. ``note`` explains a total fetch failure
+    (frame then empty) or a detected partial/stale parse (see
+    :func:`_cleveland_nowcasts`) — in the partial case ``frame`` still carries
+    whatever did parse; the Inflation-tab tooltips fall back to actual-only
+    only for the points that are genuinely missing."""
     cpi, core, note = _cleveland_nowcasts()
     months = pd.Index(sorted(set(cpi) | set(core)), name="date")
     frame = pd.DataFrame(index=months)

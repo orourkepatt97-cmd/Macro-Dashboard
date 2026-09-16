@@ -349,11 +349,16 @@ with rates_tab:
         .map(_sign_color, subset=change_cols)
         .set_properties(**{"text-align": "right"})  # header alignment is in theme.py
     )
-    st.table(styled)
-    st.caption(
-        "Level in percent (2dp) · changes in basis points (1dp) vs. the last "
-        "observation on or before each lookback date."
-    )
+    # st.table sizes to its content by default (theme.py forces width:auto on
+    # every other st.table on purpose — see the comment there). This one gets
+    # a keyed container instead, so theme.py can scope a full-width override
+    # to just this table without affecting the others.
+    with st.container(key="rate_change_table"):
+        st.table(styled)
+        st.caption(
+            "Level in percent (2dp) · changes in basis points (1dp) vs. the last "
+            "observation on or before each lookback date."
+        )
 
     # --- Yield curve: today vs 1M / 1Y ago ---------------------------
     st.subheader("Yield curve — today vs 1 month and 1 year ago")
@@ -618,7 +623,10 @@ with inflation_tab:
     )
     theme.render_chart(infl_fig)
     if nowcast_note:
-        st.caption(f"CPI nowcast unavailable — {nowcast_note}. Hover shows the actual only.")
+        # nowcast_note now also covers partial/stale parses (data.py's
+        # _cleveland_nowcasts), not just total failure, so this can't claim
+        # the nowcast is simply "unavailable" — some points may still show it.
+        st.caption(f"CPI nowcast issue — {nowcast_note}. Some points may show the actual only.")
     else:
         st.caption(
             "Hover a CPI or Core CPI point for the Cleveland Fed nowcast, actual, "

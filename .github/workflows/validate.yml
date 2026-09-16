@@ -9,6 +9,13 @@ name: Validate data pipeline
     - cron: "30 21 * * 1"
   workflow_dispatch: {}
 
+# validate_status.json is committed back to the repo (see the commit step
+# below) so the Streamlit Cloud deployment — which only ever reads its own
+# checkout, not this ephemeral runner — can pick up the result. That needs
+# write access to contents.
+permissions:
+  contents: write
+
 jobs:
   validate:
     runs-on: ubuntu-latest
@@ -21,7 +28,38 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Deliberately does not fail the step on a non-zero exit: the status
+      # file — pass or fail — still needs to be committed below before the
+      # workflow is allowed to go red. `set +e` around the run stops that
+      # exit code from aborting the step early; it's captured into EXIT
+      # either way (not just on failure) so the last step below has it
+      # regardless of outcome.
       - name: Run validate.py
         env:
           FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
-        run: python validate.py --quiet
+        run: |
+          set +e
+          python validate.py --quiet
+          echo "EXIT=$?" >> "$GITHUB_ENV"
+          set -e
+
+      # Runs, and may commit, on both the pass and the fail path above — this
+      # step doesn't look at EXIT at all, it only checks whether
+      # validate_status.json itself has new content.
+      - name: Commit updated validation status
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add validate_status.json
+          if git diff --cached --quiet; then
+            echo "validate_status.json unchanged; nothing to commit."
+          else
+            git commit -m "chore: update validation status [skip ci]"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
+
+      # Only now, after the status file is committed either way, does a
+      # failed validate.py run actually fail the workflow (and trigger the
+      # email notification).
+      - name: Fail the job if validate.py found problems
+        run: exit "${EXIT:-0}"

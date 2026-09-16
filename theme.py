@@ -270,6 +270,16 @@ span[data-tag] button, span[data-tag] svg {{ color: var(--bbg-muted) !important;
   color: var(--bbg-muted) !important; font-weight: 700 !important; text-align: left !important;
 }}
 
+/* ---- Rate Change table (Rates tab): the one st.table that should span full
+   width to match the charts above/below it, instead of shrinking to content
+   like every other st.table. table-layout:fixed splits that width evenly
+   across columns; without it, table-layout:auto dumps all the extra width
+   into a single stray-looking column instead of distributing it (the reason
+   every other st.table above is pinned to width:auto in the first place). */
+.st-key-rate_change_table [data-testid="stTable"] table {{
+  width: 100% !important; min-width: 100% !important; table-layout: fixed;
+}}
+
 /* ---- links ---- */
 a, a:visited {{ color: var(--bbg-accent) !important; text-decoration: none; }}
 a:hover {{ text-decoration: underline; }}
