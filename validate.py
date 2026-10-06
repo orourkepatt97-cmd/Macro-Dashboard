@@ -11,10 +11,15 @@ a number specific to one series baked into this script.
                    dates form a complete sequence at the frequency FRED itself
                    reports, is the latest observation within a lag budget
                    derived from that same frequency.
-    Transform    — every YoY, spread and rolling-average value data.py/app.py
-                   compute is independently recomputed here from raw
-                   observations fetched directly (not via data.fetch_series)
-                   and compared; any disagreement is an error.
+    Transform    — every YoY, spread, rolling-average and realized-vol value
+                   data.py/app.py compute is independently recomputed here
+                   from raw observations fetched directly (not via
+                   data.fetch_series) and compared; any disagreement is an
+                   error.
+    Shape        — for the one non-FRED scrape that has no second source
+                   (MOVE via Yahoo/yfinance): a plausible count of recent
+                   observations, fresh latest date, no multi-day silences,
+                   values in a sane range — a partial or empty return FAILS.
     Cross-source — FRED's DGS yields against the Fed's own H.15 release CSV;
                    the Cleveland Fed nowcast feed against its own published
                    page (same origin, so this is a reachability/recency check,
@@ -49,8 +54,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import inspect
 import io
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +94,27 @@ _MOVE_SIGMA = 5.0             # "a move beyond N std devs of its own changes"
 _LAG_BUDGET_DAYS = {
     "D": 5, "W": 12, "BW": 20, "M": 40, "Q": 100, "SA": 200, "A": 400,
 }
+
+# Per-series override of the frequency-class budget above, for a series whose
+# own publishing cadence is demonstrably slower than its frequency class
+# implies. Every entry carries its evidence — an override with no reason is
+# just a loosened check nobody can audit. Anything not listed here uses the
+# generic budget.
+_LAG_BUDGET_OVERRIDES: dict[str, tuple[int, str]] = {
+    "THREEFYTP10": (
+        9,  # a 7-day cadence plus 2 days of slack
+        "daily observations, but FRED publishes the Kim-Wright term premium in a "
+        "weekly batch — every Tuesday, data through the prior Friday (18 "
+        "consecutive weekly vintages in FRED's vintage dates), so last_updated is "
+        "legitimately up to ~7 days old; this job runs Mondays, when it's ~6",
+    ),
+}
+
+# MOVE shape check (Yahoo Finance ^MOVE via yfinance — see check_move_shape()).
+_MOVE_WINDOW_DAYS = 90          # "recent" = the last 90 calendar days (~61 sessions)
+_MOVE_MIN_RECENT_OBS = 50       # fewer than this in the window = a partial/sparse return
+_MOVE_MAX_AGE_DAYS = 7          # latest observation no older than this (covers a long weekend)
+_MOVE_SANE_RANGE = (40.0, 200.0)  # MOVE has historically lived in roughly 40-200
 
 # Series that are cumulative/monotonic *levels* (a price index or a payroll
 # count) rather than a bounded quantity (a rate, a yield, a spread, a claims
@@ -326,7 +354,8 @@ def audit_series(series_id: str) -> tuple[pd.Series, dict] | None:
     for g in matched_known:
         known(f"{series_id}: gap at {g['key']}", known_cfg["reason"])
 
-    lag_budget = _LAG_BUDGET_DAYS.get(freq_short, 60)
+    override = _LAG_BUDGET_OVERRIDES.get(series_id)
+    lag_budget = override[0] if override else _LAG_BUDGET_DAYS.get(freq_short, 60)
     last_updated_raw = meta.get("last_updated")
     last_updated = pd.Timestamp(last_updated_raw).tz_localize(None) if last_updated_raw else None
     if last_updated is None:
@@ -341,10 +370,14 @@ def audit_series(series_id: str) -> tuple[pd.Series, dict] | None:
         # label" isn't comparable across series the way "time since FRED last
         # touched it" is. Budget is still generic-by-frequency, not per-series.
         age_days = (today - last_updated.normalize()).days
-        check(f"{series_id}: FRED last updated this series within {lag_budget}d for '{freq_short}' frequency",
-              age_days <= lag_budget,
-              f"last_updated={last_updated_raw} is {age_days}d old (budget {lag_budget}d); "
-              f"latest observation dated {series.index.max().date()}")
+        fresh = age_days <= lag_budget
+        check(f"{series_id}: FRED last updated this series within {lag_budget}d for '{freq_short}' frequency"
+              + (" (per-series override)" if override else ""),
+              fresh,
+              f"last_updated={last_updated_raw} is {age_days}d old (budget {lag_budget}d"
+              # the override's rationale is only worth repeating when it's failing
+              + (f", overridden because: {override[1]}" if override and not fresh else "")
+              + f"); latest observation dated {series.index.max().date()}")
 
     return series, meta
 
@@ -493,6 +526,214 @@ def transform_checks_rolling(today: pd.Timestamp) -> None:
           f"({len(raw) - 3} weeks compared)",
           not mismatches,
           "; ".join(f"{d.date()}: manual={m:.1f} app={a}" for d, m, a in mismatches[:5]))
+
+
+def _independent_realized_vol(raw: pd.Series, days: int) -> pd.Series:
+    """Annualized realized vol (bps) from daily yield levels, in plain Python:
+    for each date with a full window, the sample (n-1) standard deviation of
+    the previous ``days`` daily changes in bps, times sqrt(252). Deliberately
+    not pandas ``rolling().std()``, so a window-alignment or ddof bug in
+    data.realized_vol_10y() can't be mirrored here."""
+    levels, dates = raw.tolist(), raw.index
+    changes = [(levels[i] - levels[i - 1]) * 100.0 for i in range(1, len(levels))]
+    out: dict[pd.Timestamp, float] = {}
+    for end in range(days, len(changes) + 1):
+        window = changes[end - days : end]   # changes[k] is the move into dates[k + 1]
+        mean = sum(window) / days
+        variance = sum((x - mean) ** 2 for x in window) / (days - 1)
+        out[dates[end]] = math.sqrt(variance) * math.sqrt(252)
+    return pd.Series(out, dtype="float64").sort_index()
+
+
+def transform_checks_realized_vol(today: pd.Timestamp) -> None:
+    section("Transform checks — realized 10Y vol (independent recomputation)")
+    start = (today - pd.DateOffset(years=1)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+    raw = fred_obs("DGS10", (today - pd.DateOffset(years=1, days=90)).strftime("%Y-%m-%d"), end)
+    if raw is None or raw.empty:
+        check("Realized vol: raw DGS10 available for recomputation", False, "fetch failed")
+        return
+
+    # The window the app actually uses (data.py's default), plus a second window
+    # so the *parameter* is exercised rather than one hardcoded value.
+    default_days = inspect.signature(data.realized_vol_10y).parameters["days"].default
+    for days in sorted({10, default_days}):
+        got = data.realized_vol_10y(start, end, days)
+        expected = _independent_realized_vol(raw, days)
+        common = expected.index.intersection(got.index)
+        common = common[common >= pd.Timestamp(start)]
+        if common.empty:
+            check(f"Realized vol ({days}d): overlapping dates to compare", False, "no common dates")
+            continue
+        diffs = (expected.loc[common] - got.loc[common]).abs()
+        worst = diffs.idxmax()
+        ok = diffs.max() < 1e-6
+        check(f"Realized vol ({days}d): matches independent recomputation ({len(common)} days compared)",
+              ok,
+              "" if ok else
+              f"largest disagreement at {worst.date()}: data.py={got.loc[worst]:.4f}bp "
+              f"independent={expected.loc[worst]:.4f}bp")
+
+
+def check_move_shape(today: pd.Timestamp) -> pd.Series | None:
+    """Shape check on data.move_index() (Yahoo Finance ^MOVE via yfinance, an
+    unofficial scrape). A partial or empty return must FAIL, not pass silently:
+    a scrape that quietly degrades to a handful of rows, a stale tail, or
+    garbage values still "returns data", so asserting only "non-empty" would
+    let it through. Returns the series (for the generic sanity checks) or
+    ``None`` if it didn't come back at all."""
+    section("Shape checks — MOVE (Yahoo Finance ^MOVE)")
+    series, note = data.move_index()
+    returned = note is None and not series.empty
+    if not check("MOVE: fetch returned data", returned,
+                 "" if returned else (note or "empty series (no note given)")):
+        return None
+
+    recent = series[series.index >= today - pd.Timedelta(days=_MOVE_WINDOW_DAYS)]
+    count_ok = len(recent) >= _MOVE_MIN_RECENT_OBS
+    check(f"MOVE: plausible observation count in the last {_MOVE_WINDOW_DAYS}d",
+          count_ok,
+          f"{len(recent)} observations" if count_ok else
+          f"{len(recent)} observations, need at least {_MOVE_MIN_RECENT_OBS} "
+          "(~61 expected) — looks like a partial/sparse return")
+
+    age = (today - series.index.max()).days
+    check(f"MOVE: latest observation within {_MOVE_MAX_AGE_DAYS}d",
+          age <= _MOVE_MAX_AGE_DAYS,
+          f"latest observation {series.index.max().date()} is {age}d old")
+
+    gaps = _find_gaps(recent.index, "D")
+    check(f"MOVE: no multi-day silences in the last {_MOVE_WINDOW_DAYS}d",
+          not gaps, "; ".join(g["detail"] for g in gaps))
+
+    lo, hi = _MOVE_SANE_RANGE
+    outside = recent[(recent < lo) | (recent > hi)]
+    range_note = f"recent range [{recent.min():.1f}, {recent.max():.1f}]"
+    check(f"MOVE: recent values within the sane range [{lo:g}, {hi:g}]",
+          outside.empty,
+          range_note if outside.empty else
+          "; ".join(f"{d.date()}={v:.1f}" for d, v in outside.head(5).items())
+          + (f" (+{len(outside) - 5} more)" if len(outside) > 5 else "")
+          + f" — {range_note}")
+
+    return series[series.index >= today - pd.DateOffset(years=_HISTORY_YEARS)]
+
+
+def transform_checks_regime(today: pd.Timestamp) -> None:
+    """Independent recomputation of the Rate Regime chart's derived values:
+    the joined (10Y, MOVE) frame, the current regime run, and the regime path.
+    Plain loops and ``bisect`` on lists — no pandas groupby/shift/searchsorted —
+    so a bug in data.regime_run / data.regime_path can't be mirrored here. The
+    raw 10Y comes from this script's own FRED fetch. MOVE has no second
+    source, so it is the shared input (its own shape check covers it); if it
+    didn't come back, this is skipped rather than double-reporting that."""
+    from bisect import bisect_right
+
+    section("Transform checks — regime run & path (independent recomputation)")
+    move, note = data.move_index()
+    if note or move.empty:
+        return
+    end = today.strftime("%Y-%m-%d")
+    raw = fred_obs("DGS10", move.index.min().strftime("%Y-%m-%d"), end)
+    if raw is None or raw.empty:
+        check("Regime: raw DGS10 available for recomputation", False, "fetch failed")
+        return
+
+    y_by_day = raw.to_dict()
+    rows = [(d, float(y_by_day[d]), float(m)) for d, m in move.items()
+            if d in y_by_day and d <= today]
+    dates = [r[0] for r in rows]
+    thr_y, thr_m = 4.0, 100.0        # the logic is threshold-agnostic; any pair exercises it
+
+    # 1. the joined frame itself (data.regime_history vs. this script's own join)
+    got, _ = data.regime_history(end)
+    same_days = list(got.index) == dates
+    worst = max((abs(got["y10"].iloc[i] - rows[i][1]) for i in range(min(len(got), len(rows)))), default=0.0)
+    check(f"Regime frame: matches an independent join of DGS10 and MOVE ({len(rows)} days)",
+          same_days and worst < 1e-9,
+          f"{len(got)} days in data.py vs {len(rows)} independent; max |Δ10Y|={worst:.6f}"
+          if not (same_days and worst < 1e-9) else "")
+
+    # 2. current regime run, walked back from the newest row with a plain loop
+    def quadrant(y, m):
+        return ("RESTRICTIVE" if y > thr_y else "ACCOMMODATIVE") + " / " + ("STRESSED" if m > thr_m else "CALM")
+    i = len(rows) - 1
+    while i > 0 and quadrant(*rows[i - 1][1:]) == quadrant(*rows[i][1:]):
+        i -= 1
+    run = data.regime_run(got, thr_y, thr_m)
+    want = {"label": quadrant(*rows[-1][1:]), "entered": rows[i][0], "observations": len(rows) - i,
+            "days": (rows[-1][0] - rows[i][0]).days, "truncated": i == 0}
+    ok = run is not None and all(run[k] == v for k, v in want.items())
+    check("Regime run: matches an independent backward walk",
+          ok, "" if ok else f"data.py={run} independent={want}")
+
+    # 3. the path at every cadence, for several windows. Targets are generated here
+    #    with stdlib calendar arithmetic (not pandas DateOffset) so the month/year
+    #    stepping is independently derived; "last observation on or before" is a
+    #    bisect on a plain list.
+    import calendar
+
+    def months_back(day, n):
+        month_index = day.year * 12 + (day.month - 1) - n
+        year, month = divmod(month_index, 12)
+        return pd.Timestamp(year, month + 1, min(day.day, calendar.monthrange(year, month + 1)[1]))
+
+    def independent_targets(start, cadence, weekday):
+        out, step = [], {"M": 1, "Q": 3, "Y": 12}.get(cadence)
+        if cadence == "D":
+            d = today
+            while d >= start:
+                out.append(d); d -= pd.Timedelta(days=1)
+        elif cadence == "W":
+            d = today
+            while d.weekday() != weekday:
+                d -= pd.Timedelta(days=1)
+            while d >= start:
+                out.append(d); d -= pd.Timedelta(days=7)
+        else:
+            k = 0
+            while (d := months_back(today, step * k)) >= start:
+                out.append(d); k += 1
+        return out
+
+    bad, compared = [], 0
+    for days_back in (91, 365, 730, 1825):
+        start = today - pd.Timedelta(days=days_back)
+        for cadence in ("D", "W", "M", "Q", "Y"):
+            for weekday in (range(7) if cadence == "W" else (today.weekday(),)):
+                expected = []
+                for target in independent_targets(start, cadence, weekday):
+                    pos = bisect_right(dates, target) - 1            # last observation on or before
+                    if pos >= 0 and dates[pos] >= start and (not expected or expected[-1] != dates[pos]):
+                        expected.append(dates[pos])
+                expected.sort()
+                in_window = [d for d in dates if start <= d <= today]
+                if not expected or expected[-1] != in_window[-1]:
+                    expected.append(in_window[-1])                   # always runs into the latest print
+                path = data.regime_path(got, start, today, cadence, weekday)
+                values_ok = all(
+                    abs(path["y10"].loc[d] - rows[bisect_right(dates, d) - 1][1]) < 1e-9
+                    and abs(path["move"].loc[d] - rows[bisect_right(dates, d) - 1][2]) < 1e-9
+                    for d in expected if d in path.index
+                )
+                compared += 1
+                if list(path.index) != expected or not values_ok:
+                    bad.append(f"{days_back}d/{cadence}/wd{weekday}: {len(path)} vs {len(expected)} points")
+    check(f"Regime path: matches an independent target walk ({compared} window x cadence x weekday cases)",
+          not bad, "; ".join(bad[:4]))
+
+    # 4. the property the cadence selection exists for: a readable point count at
+    #    every standard period (the chart is unreadable past ~two dozen points)
+    counts = {}
+    for label, days_back in (("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365), ("2Y", 730), ("5Y", 1825)):
+        path, cadence = data.auto_regime_path(got, today - pd.Timedelta(days=days_back), today, today.weekday())
+        counts[label] = (cadence, len(path))
+    unreadable = {k: v for k, v in counts.items() if not 10 <= v[1] <= data.REGIME_PATH_MAX_POINTS}
+    check("Regime path: auto cadence keeps every standard period at a readable point count "
+          f"(10-{data.REGIME_PATH_MAX_POINTS})",
+          not unreadable,
+          f"out of range: {unreadable}" if unreadable else
+          ", ".join(f"{k} {c}/{n}" for k, (c, n) in counts.items()))
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +893,8 @@ def all_series() -> dict[str, str]:
         out[sid] = label
     for sid, label in data.CREDIT_SERIES.items():
         out[sid] = label
+    for sid, label in data.RATE_ENV_SERIES.items():
+        out[sid] = label
     return out
 
 
@@ -680,6 +923,12 @@ def main() -> int:
     transform_checks_yoy(today)
     transform_checks_spreads(today)
     transform_checks_rolling(today)
+    transform_checks_realized_vol(today)
+
+    move_history = check_move_shape(today)
+    if move_history is not None:
+        histories["MOVE"] = move_history   # joins the generic own-history sanity bounds
+        transform_checks_regime(today)
 
     cross_source_h15(today)
     cross_source_cleveland_nowcast()

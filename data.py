@@ -107,6 +107,19 @@ CREDIT_SERIES: dict[str, str] = {
     "BAMLC0A0CM": "IG OAS",
 }
 
+# Rate Environment tab. THREEFYTP10 is the Kim-Wright 10-year term premium
+# (a Federal Reserve Board model) — the only 10Y term premium FRED carries.
+# The NY Fed's ACM series ("ACMTP10") exists only in the NY Fed's own data
+# file, NOT on FRED: asking FRED for ACMTP10 returns "series does not exist".
+# Both are model-based 10Y term premia with the same sign convention, but they
+# are different estimates and read a bit differently in level.
+TERM_PREMIUM_SERIES = "THREEFYTP10"
+RATE_ENV_SERIES: dict[str, str] = {TERM_PREMIUM_SERIES: "10Y term premium (Kim-Wright)"}
+
+# MOVE (ICE BofA) comes from Yahoo Finance, not FRED — an unofficial scrape of
+# a licensed ICE index; see move_index().
+_MOVE_TICKER = "^MOVE"
+
 
 class FredAPIError(RuntimeError):
     """Raised when a FRED request fails or the API key is missing."""
@@ -702,6 +715,238 @@ def fetch_change_window() -> pd.DataFrame:
     end = pd.Timestamp.today().normalize()
     start = end - pd.DateOffset(months=14)
     return fetch_treasury_yields(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def realized_vol_10y(start_date: str, end_date: str, days: int = 20) -> pd.Series:
+    """Annualized realized volatility of the 10Y Treasury yield, in basis points.
+
+    Daily yield changes in bps (consecutive DGS10 observations — holidays are
+    not observations, so a change can span one), sample standard deviation
+    (ddof=1) over the trailing ``days`` observations, times sqrt(252). Indexed
+    by the last observation in each window, trimmed to ``[start_date,
+    end_date]``. Takes the same date-range arguments as the other fetchers so
+    it lines up with the page's period selector; ``days`` is the lookback.
+
+    Reuses :func:`fetch_series` for DGS10 (no new source). Extra history is
+    fetched before ``start_date`` so the first visible point already has a
+    full window rather than starting ``days`` observations late.
+    """
+    pad = (pd.Timestamp(start_date) - pd.Timedelta(days=days * 2 + 10)).strftime("%Y-%m-%d")
+    yields = fetch_series("DGS10", pad, end_date)
+    change_bps = yields.diff() * 100.0
+    vol = (change_bps.rolling(days).std() * np.sqrt(252)).dropna()
+    vol = vol.loc[start_date:end_date]
+    vol.name = "RV10Y"
+    vol.index.name = "date"
+    return vol
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def move_index() -> tuple[pd.Series, str | None]:
+    """``(series, note)`` — the ICE BofA MOVE index (Treasury implied vol, a
+    normalized basis-point vol) from Yahoo Finance's ``^MOVE``, full history,
+    date-indexed, daily closes.
+
+    This is an unofficial scrape of a licensed ICE index via the unofficial
+    yfinance wrapper — fragile (Yahoo changes things, and rate-limits or
+    blocks some cloud IPs) and personal-use only; do not republish it or
+    expose it as a bulk export. Any failure — yfinance missing, network,
+    Yahoo returning nothing — returns an empty series plus a short ``note``
+    (same ``(data, note)`` shape as markets.py) so the tab degrades instead of
+    erroring. Cached an hour like the FRED fetchers; a failure is cached too,
+    so the header's refresh button is the way to retry sooner.
+    """
+    empty = pd.Series(dtype="float64", name="MOVE")
+    try:
+        import yfinance as yf  # imported here so a missing package degrades, not crashes
+        hist = yf.Ticker(_MOVE_TICKER).history(period="max", auto_adjust=False, timeout=20)
+    except Exception as exc:  # noqa: BLE001 — a flaky scrape must never break the tab
+        return empty, f"MOVE unavailable — Yahoo Finance fetch failed ({type(exc).__name__})"
+
+    if hist is None or hist.empty or "Close" not in hist.columns:
+        return empty, "MOVE unavailable — Yahoo Finance returned no data for ^MOVE"
+
+    close = pd.to_numeric(hist["Close"], errors="coerce").dropna()
+    close = close[close > 0]
+    if close.empty:
+        return empty, "MOVE unavailable — Yahoo Finance returned no usable closes for ^MOVE"
+
+    # Yahoo's index is tz-aware at midnight exchange time; FRED's is tz-naive
+    # dates. Drop the tz (keeping the local calendar date) so they join.
+    close.index = pd.DatetimeIndex(close.index).tz_localize(None).normalize()
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    close.name = "MOVE"
+    close.index.name = "date"
+    return close, None
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner="Fetching term premium from FRED…")
+def term_premium(start_date: str, end_date: str) -> pd.Series:
+    """10Y term premium in percent (Kim-Wright, FRED ``THREEFYTP10`` — see
+    :data:`TERM_PREMIUM_SERIES` for why it isn't the NY Fed's ACM). Daily, but
+    FRED updates it in a weekly batch (Tuesdays, data through the prior
+    Friday), so it runs about a week behind the Treasury series. Positive =
+    investors demanding compensation for holding duration; negative = they
+    accept less than the expected short-rate path."""
+    return fetch_series(TERM_PREMIUM_SERIES, start_date, end_date)
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def regime_history(end_date: str) -> tuple[pd.DataFrame, str | None]:
+    """``(frame, note)`` — daily 10Y yield (``y10``, percent) and MOVE
+    (``move``) on the days both exist, over MOVE's *full* history through
+    ``end_date``. The Rate Environment tab draws the selected period from this
+    but also needs the history before it: how long the current regime has
+    lasted can reach back years, well past a 1M or 1Y view. Empty frame +
+    ``note`` if MOVE is unavailable (see :func:`move_index`)."""
+    move, note = move_index()
+    if note or move.empty:
+        return pd.DataFrame(columns=["y10", "move"]), note or "MOVE unavailable"
+    y10 = fetch_series("DGS10", move.index.min().strftime("%Y-%m-%d"), end_date)
+    frame = pd.concat({"y10": y10, "move": move.loc[:end_date]}, axis=1, join="inner")
+    frame.index.name = "date"
+    return frame.sort_index(), None
+
+
+def regime_label(y10: float, move: float, y_threshold: float, move_threshold: float) -> str:
+    """Quadrant name for a (10Y yield %, MOVE) reading. Thresholds are strict:
+    a reading exactly on a divider falls to ACCOMMODATIVE / CALM."""
+    return (
+        f"{'RESTRICTIVE' if y10 > y_threshold else 'ACCOMMODATIVE'}"
+        f" / {'STRESSED' if move > move_threshold else 'CALM'}"
+    )
+
+
+def regime_run(
+    frame: pd.DataFrame, y_threshold: float, move_threshold: float
+) -> dict | None:
+    """The quadrant the latest observation sits in and how long it has been
+    there. Pure. ``frame`` is a daily (``y10``, ``move``) frame.
+
+    The duration is the length of the *current unbroken run*: walk back from the
+    latest observation while consecutive observations stay in the same
+    quadrant; ``entered`` is the first observation of that run. A single
+    observation in another quadrant breaks the run — so a regime that was left
+    for one day and re-entered counts from the re-entry, not from before.
+    ``days`` is calendar days from ``entered`` to the latest observation (the
+    data's as-of date, not today's date, which can be days later). ``truncated``
+    is True when the run reaches the start of ``frame`` — "since at least".
+    ``None`` for an empty frame.
+    """
+    frame = frame.dropna(subset=["y10", "move"]).sort_index()
+    if frame.empty:
+        return None
+    quadrant = pd.Series(
+        [regime_label(y, m, y_threshold, move_threshold)
+         for y, m in zip(frame["y10"], frame["move"])],
+        index=frame.index,
+    )
+    run_id = (quadrant != quadrant.shift()).cumsum()
+    in_run = (run_id == run_id.iloc[-1]).to_numpy()
+    entered = frame.index[int(in_run.argmax())]   # first True: the run is the contiguous tail
+    as_of = frame.index[-1]
+    return {
+        "label": quadrant.iloc[-1], "entered": entered, "as_of": as_of,
+        "days": (as_of - entered).days, "observations": int(in_run.sum()),
+        "truncated": bool(entered == frame.index[0]),
+    }
+
+
+# Path cadences for the Rate Regime chart, finest to coarsest. A path past about
+# two dozen joined points is unreadable (it loops and its labels collide), so
+# the cadence is chosen to keep the point count at or under the cap.
+REGIME_PATH_CADENCES = ("D", "W", "M", "Q", "Y")
+REGIME_PATH_MAX_POINTS = 28   # "roughly 12-26"; 28 lets a 6M weekly path (27 points) stay weekly
+
+
+def _path_targets(
+    start: pd.Timestamp, end: pd.Timestamp, cadence: str, weekday: int
+) -> list[pd.Timestamp]:
+    """Target dates for a path cadence, newest first, down to ``start``: every
+    day (``D``); every 7th day on ``weekday`` (``W``); the same day of each
+    month (``M``), every third month (``Q``) or year (``Y``) counting back from
+    ``end`` — calendar arithmetic, so a 31st clamps to a short month's end."""
+    end = end.normalize()
+    out: list[pd.Timestamp] = []
+    if cadence == "D":
+        day = end
+        while day >= start:
+            out.append(day)
+            day -= pd.Timedelta(days=1)
+    elif cadence == "W":
+        day = end - pd.Timedelta(days=(end.weekday() - weekday) % 7)
+        while day >= start:
+            out.append(day)
+            day -= pd.Timedelta(days=7)
+    else:
+        step = {"M": 1, "Q": 3, "Y": 12}[cadence]
+        k = 0
+        while (day := end - pd.DateOffset(months=step * k)) >= start:
+            out.append(day)
+            k += 1
+    return out
+
+
+def regime_path(
+    frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp,
+    cadence: str, weekday: int = 0,
+) -> pd.DataFrame:
+    """Trajectory through a daily (``y10``, ``move``) frame at one cadence
+    (``D``/``W``/``M``/``Q``/``Y``, see :func:`_path_targets`), oldest to newest.
+    Pure.
+
+    For each target date the point is the *last observation on or before it* —
+    the same lookback convention as :func:`movement_table` — so a holiday or
+    missing day falls back to the prior print instead of leaving a gap. Two
+    targets that resolve to the same observation yield one point. If the latest
+    observation in the window isn't already the newest point (a ``weekday`` that
+    doesn't match ``end``'s, say), it is appended so the path always runs into
+    the current observation. Columns: ``y10``, ``move``, ``anchor`` (the target
+    date that produced the point).
+    """
+    frame = frame.dropna(subset=["y10", "move"]).sort_index()
+    window = frame.loc[start:end]
+    if window.empty:
+        return pd.DataFrame(columns=["y10", "move", "anchor"])
+
+    rows: list[tuple[pd.Timestamp, pd.Timestamp, float, float]] = []
+    for anchor in _path_targets(start, end, cadence, weekday):
+        pos = frame.index.searchsorted(anchor, side="right") - 1   # last obs on or before
+        if pos >= 0:
+            when = frame.index[pos]
+            if when >= start and (not rows or rows[-1][0] != when):
+                rows.append((when, anchor, float(frame["y10"].iloc[pos]), float(frame["move"].iloc[pos])))
+    path = pd.DataFrame(rows, columns=["date", "anchor", "y10", "move"]).set_index("date").sort_index()
+
+    latest = window.index[-1]
+    if path.empty or path.index[-1] != latest:
+        tail = pd.DataFrame(
+            {"anchor": [latest], "y10": [float(window["y10"].iloc[-1])],
+             "move": [float(window["move"].iloc[-1])]},
+            index=pd.Index([latest], name="date"),
+        )
+        path = pd.concat([path, tail]).sort_index()
+    return path[["y10", "move", "anchor"]]
+
+
+def auto_regime_path(
+    frame: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp, weekday: int
+) -> tuple[pd.DataFrame, str]:
+    """``(path, cadence)`` — the finest cadence that keeps the path readable.
+    Starts from a band by span (under 3 months daily, up to a year weekly, longer
+    monthly) and steps to the next-coarser cadence while the path still has more
+    than :data:`REGIME_PATH_MAX_POINTS` points. The step-up matters: the bands
+    alone leave a 1Y view at ~53 weekly points and a 5Y view at ~60 monthly
+    ones, the clutter this exists to avoid."""
+    span = (end - start).days
+    first = "D" if span < 91 else ("W" if span <= 365 else "M")
+    cadence, path = first, pd.DataFrame(columns=["y10", "move", "anchor"])
+    for cadence in REGIME_PATH_CADENCES[REGIME_PATH_CADENCES.index(first):]:
+        path = regime_path(frame, start, end, cadence, weekday)
+        if len(path) <= REGIME_PATH_MAX_POINTS:
+            break
+    return path, cadence
 
 
 @st.cache_data(ttl=_CACHE_TTL, show_spinner=False)

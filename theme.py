@@ -26,6 +26,7 @@ _MUTED = "#8a8a8a"   # labels, ticks, axis lines
 _LINE = "#2a2a2a"    # 1px borders / rules
 _GRID = "rgba(255,255,255,0.06)"  # thin low-opacity chart grid
 _ACCENT = "#ff9900"  # amber
+ACCENT = _ACCENT     # public alias: the amber accent for data (e.g. the "latest" marker)
 
 # Passed to every st.plotly_chart call: no modebar, no logo.
 PLOTLY_CONFIG = {"displayModeBar": False, "displaylogo": False, "showTips": False}
@@ -46,14 +47,16 @@ TENOR_LINE: dict[str, dict] = {
 # ordered list of line colours for its options; the pill for option N is tinted
 # colour N and gets a 2px underline in that colour when selected. Colours must
 # match the trace colours set in app.py (_CREDIT_SPEC / _INFLATION_SPEC /
-# _LABOR_UR_SPEC / _CLAIMS_SPEC) and TENOR_LINE, in the same option order.
+# _LABOR_UR_SPEC / _CLAIMS_SPEC / _VOL_SPEC) and TENOR_LINE, in the same
+# option order.
 _PILL_TINTS: dict[str, list[str]] = {
     "tenors": [TENOR_LINE[sid]["color"]
                for sid in ("DGS3MO", "DGS2", "DGS5", "DGS10", "DGS30")],
     "credit_series": ["#cf9038", "#d0d0d0", "#e05252", "#7f8fbf"],   # HY OAS, IG OAS, HY-IG, 2s10s
     "inflation_series": ["#cf9038", "#e05252", "#d0d0d0", "#7f8fbf"],  # CPI, Core CPI, Core PCE, 10Y breakeven
     "labor_ur": ["#cf9038", "#7f8fbf"],                              # Unemployment, Participation
-    "labor_claims": ["#cf9038", "#e05252", "#7f8fbf"],               # Initial, Initial 4wk avg, Continuing
+    "labor_claims": ["#e05252", "#7f8fbf"],                          # Initial 4wk avg, Continuing
+    "vol_series": ["#cf9038", "#7f8fbf"],                            # MOVE, Realized 10Y vol
 }
 
 # Every pill group that uses the borderless underline style. The tinted ones
@@ -343,3 +346,51 @@ def render_chart(fig: go.Figure) -> None:
     """``st.plotly_chart`` with the modebar hidden and Streamlit's own theme
     disabled so the ``bloomberg`` template shows through."""
     st.plotly_chart(fig, theme=None, config=PLOTLY_CONFIG, width="stretch")
+
+
+def pick_labels(
+    xs, ys, texts, candidates, *, x_range, y_range, size=(780, 466),
+    reserved=None, char_px=5.6, line_h=11.0, pad=2.0, marker_radius=7.0,
+):
+    """Choose which scatter-point date labels to draw so none overlap.
+
+    ``xs`` / ``ys`` / ``texts`` are parallel (one entry per point);
+    ``candidates`` lists the indices that *want* a label, highest priority
+    first. Each is placed, in order, only if its box (text to the upper right
+    of the marker, as ``textposition="top right"`` draws it) stays inside the
+    plot and doesn't touch a label already placed — an overlapping one is
+    skipped, never moved. ``reserved`` is an optional ``(x, y, text)`` for a
+    label that is already fixed (the latest point's, centred above its larger
+    marker) and takes precedence over everything. Returns the chosen indices.
+
+    Geometry is estimated, not measured: data coordinates map to pixels through
+    ``x_range`` / ``y_range`` over an assumed plot ``size`` (the wide layout's
+    plot area at a ~1000px viewport — conservative for wider screens), and a
+    label is ``char_px`` per character (9px monospace) by ``line_h`` tall.
+    """
+    width, height = size
+
+    def to_px(x, y):
+        return ((x - x_range[0]) / (x_range[1] - x_range[0]) * width,
+                (y_range[1] - y) / (y_range[1] - y_range[0]) * height)
+
+    def touches(a, b):
+        return not (a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1])
+
+    placed = []
+    if reserved is not None:
+        rx, ry = to_px(reserved[0], reserved[1])
+        half = len(reserved[2]) * char_px / 2
+        placed.append((rx - half, ry - marker_radius - 3 - line_h, rx + half, ry - marker_radius - 3))
+
+    chosen = []
+    for i in candidates:
+        px, py = to_px(xs[i], ys[i])
+        box = (px + 4, py - 3 - line_h, px + 4 + len(texts[i]) * char_px, py - 3)
+        if box[2] > width or box[1] < 0:                  # would run off the plot
+            continue
+        if any(touches(box, other) for other in placed):  # would overlap a placed label
+            continue
+        placed.append(box)
+        chosen.append(i)
+    return chosen
