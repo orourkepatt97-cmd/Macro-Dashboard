@@ -96,9 +96,9 @@ _CLAIMS_SPEC = [                      # (label, colour, on secondary axis)
     ("Initial 4wk avg", "#e05252", False),
     ("Continuing claims", "#7f8fbf", True),
 ]
-_VOL_SPEC = [                         # (label, colour, on secondary axis)
-    ("MOVE", "#cf9038", False),
-    ("Realized 10Y vol", "#7f8fbf", True),
+_VOL_SPEC = [                         # (label, colour)
+    ("MOVE", "#cf9038"),
+    ("Realized 10Y vol", "#7f8fbf"),
 ]
 
 # Rate Environment regime thresholds (quadrant dividers).
@@ -276,13 +276,18 @@ def _stop_tab() -> None:
 
 @contextmanager
 def _tab(container):
-    """``with container:`` that a block can leave early via _stop_tab(). Only
-    _StopTab is swallowed — a real exception still surfaces as before."""
+    """``with container:`` that a block can leave early via _stop_tab(). _StopTab
+    is swallowed silently; any other exception is shown in this tab only via
+    st.exception() so later tabs still render. Streamlit's own control flow
+    (st.stop / rerun) derives from BaseException, so `except Exception` leaves it
+    alone."""
     with container:
         try:
             yield
         except _StopTab:
             pass
+        except Exception as exc:
+            st.exception(exc)
 
 
 (
@@ -676,10 +681,11 @@ def _render_rate_environment(start: date, end: date) -> None:
     )
 
     # --- Section 2: rate volatility ----------------------------------------
-    # Different units (MOVE is normalized bp vol, realized is annualized bp), so
-    # each gets its own axis rather than being forced onto one scale.
+    # MOVE (normalized bp vol) and realized vol (annualized bp) are both
+    # basis-point volatilities, so they share one y-axis and are directly
+    # comparable — a gap between the lines is a real implied-vs-realized gap.
     st.subheader("Rate volatility")
-    vol_labels = [label for label, _, _ in _VOL_SPEC]
+    vol_labels = [label for label, _ in _VOL_SPEC]
     vol_pick = st.pills(
         "Volatility series", vol_labels, selection_mode="multi",
         default=vol_labels, key="vol_series", label_visibility="collapsed",
@@ -691,41 +697,26 @@ def _render_rate_environment(start: date, end: date) -> None:
         st.info("No volatility data in the selected range.")
     else:
         vol_data = {"MOVE": move, "Realized 10Y vol": realized}
-        vol_fig = make_subplots(specs=[[{"secondary_y": True}]])
-        for label, colour, on_secondary in _VOL_SPEC:
+        vol_fig = go.Figure()
+        for label, colour in _VOL_SPEC:
             series = vol_data[label]
             if label not in (vol_pick or []) or series.empty:
                 continue
-            vol_fig.add_trace(
-                go.Scatter(
-                    x=series.index, y=series.values, name=label, mode="lines",
-                    line=dict(color=colour, width=1.6),
-                    hovertemplate=f"<b>%{{x|%b %d, %Y}}</b><br>{label}: %{{y:.1f}}<extra></extra>",
-                ),
-                # without MOVE there is nothing to share an axis with
-                secondary_y=on_secondary and have_move,
-            )
-        left_series = move if have_move else realized
-        left_rng = _padded_range([left_series])
+            vol_fig.add_trace(go.Scatter(
+                x=series.index, y=series.values, name=label, mode="lines",
+                line=dict(color=colour, width=1.6),
+                hovertemplate=f"<b>%{{x|%b %d, %Y}}</b><br>{label}: %{{y:.1f}}<extra></extra>",
+            ))
+        vol_rng = _padded_range([move, realized])   # both series, so toggling doesn't rescale
         vol_fig.update_layout(
-            height=420, margin=dict(l=60, r=60 if have_move else 14, t=10, b=28),
+            height=420, margin=dict(l=60, r=14, t=10, b=28),
             showlegend=False, hovermode="closest",
         )
         vol_fig.update_xaxes(title=None)
         vol_fig.update_yaxes(
-            title_text="MOVE (normalized bp vol)" if have_move else "Realized 10Y vol (annualized bp)",
-            tickformat=".0f", color="#cf9038" if have_move else "#7f8fbf",
-            secondary_y=False, **({"range": left_rng} if left_rng else {}),
+            title_text="Volatility (bp)", tickformat=".0f",
+            **({"range": vol_rng} if vol_rng else {}),
         )
-        if have_move:
-            right_rng = _padded_range([realized])
-            vol_fig.update_yaxes(
-                title_text="Realized 10Y vol (annualized bp)", tickformat=".0f",
-                color="#7f8fbf", showgrid=False, secondary_y=True,
-                **({"range": right_rng} if right_rng else {}),
-            )
-        else:
-            vol_fig.update_yaxes(visible=False, secondary_y=True)
         theme.render_chart(vol_fig)
         realized_def = (
             f"Realized is the {_REALIZED_VOL_DAYS}-observation trailing standard deviation of "

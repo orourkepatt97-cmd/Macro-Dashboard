@@ -1,19 +1,22 @@
 # Macro Dashboard
 
 Streamlit dashboard for the US Treasury curve (3M / 2Y / 5Y / 10Y / 30Y), curve
-spreads, credit spreads, and inflation — sourced from
-[FRED](https://fred.stlouisfed.org/), with Fed-decision odds from Kalshi and
-market news from RSS.
+spreads, rate regime and volatility, credit spreads, inflation, labor, and an
+economic calendar — sourced from [FRED](https://fred.stlouisfed.org/), with
+Fed-decision odds from Kalshi, the MOVE index from Yahoo Finance, and market news
+from RSS. Live at https://macro-terminal.streamlit.app/. See `CLAUDE.md` for the
+detailed engineering briefing.
 
 ## Layout
 
 | File | Responsibility |
 | --- | --- |
-| `data.py` | All FRED fetching + pure transforms. Fetch functions are cached with `@st.cache_data`. |
+| `data.py` | All FRED fetching, other data fetches (Cleveland Fed nowcast, FX Blue NFP forecast, MOVE) + pure transforms. Fetch functions are cached with `@st.cache_data`. |
 | `feeds.py` | RSS/Atom fetching + parsing for the News tab. Cached 15 min; one dead feed never breaks the tab. |
 | `markets.py` | Kalshi Fed-decision markets (public REST, no auth). Cached 15 min; any failure returns an empty frame + note. |
 | `theme.py` | Bloomberg-terminal styling: global CSS + shared Plotly template. |
 | `app.py` | UI only — top-of-page controls, tabs, widgets, chart assembly. |
+| `validate.py` | Independent audit of the data pipeline (run weekly by GitHub Actions; writes `validate_status.json`, shown in the page header). |
 
 ## Setup
 
@@ -30,9 +33,13 @@ Get a free API key at https://fredaccount.stlouisfed.org/apikeys.
 
 ```bash
 streamlit run app.py
+python validate.py   # optional: audit the data pipeline (--quiet for CI)
 ```
 
 ## Features
+
+Tabs, in order: Rates · Rate Environment · Inflation · Labor · Credit · News ·
+Calendar.
 
 **Controls (top of page)**
 
@@ -53,6 +60,19 @@ streamlit run app.py
 - **Fed decision odds (Kalshi):** implied probability and volume for each outcome
   of the next two FOMC meetings, from `KXFEDDECISION` market prices. Shows a note
   instead of the table if Kalshi is unreachable.
+- **Rate change:** movement table for the five tenors plus the 2s10s / 5s30s
+  spreads: last level (%), then change in bps over 1D / 1W / 1M / 3M / YTD / 1Y.
+  Each change compares the latest observation to the last observation on or
+  before the lookback date, so weekends and holidays are handled by value, not
+  row offset.
+
+**Rate Environment tab**
+
+- **Rate regime:** scatter of the 10Y yield vs the MOVE index, with a path whose
+  cadence scales with the selected period, quadrant dividers (10Y = 4.00%,
+  MOVE = 100), and a caption giving the current regime and how long it has lasted.
+- **Rate volatility:** MOVE (implied) vs 20-observation realized 10Y vol.
+- **Term premium:** Kim-Wright 10Y term premium (`THREEFYTP10`) with a zero line.
 
 **Credit tab**
 
@@ -61,19 +81,24 @@ streamlit run app.py
   range).
 - HY OAS vs the 2s10s spread on a dual axis — credit and curve on one chart.
 
-**Change tab**
-
-- Movement table for the five tenors plus the 2s10s / 5s30s spreads: last level
-  (%), then change in bps over 1D / 1W / 1M / 3M / YTD / 1Y. Each change compares
-  the latest observation to the last observation on or before the lookback date,
-  so weekends and holidays are handled by value, not row offset.
-
 **Inflation tab**
 
 - CPI (`CPIAUCSL`) and core PCE (`PCEPILFE`) as year-over-year %, plus the 10-year
   breakeven rate (`T10YIE`), on one chart, with latest-value metrics.
 - CPI/PCE are index levels; ~13 months of extra history are fetched so the
   trailing-12-month change is populated from the first visible point.
+
+**Labor tab**
+
+- Unemployment rate, jobless claims (4-week average and continuing), and
+  nonfarm payrolls (with the FX Blue consensus forecast in the tooltip), plus
+  latest-value metrics including average hourly earnings YoY.
+
+**Calendar tab**
+
+- Upcoming data releases (CPI, PPI, payrolls, retail sales, PCE) and FOMC
+  meetings from a hardcoded schedule — release dates cover 2026 only and need a
+  yearly refresh.
 
 **News tab**
 

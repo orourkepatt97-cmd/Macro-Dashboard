@@ -80,9 +80,11 @@ custom date range) are real stops on purpose — no tab has a valid range then.
 Verified with simulated outages on the old vs. new code: an outage in one tab's
 fetch now blanks only the tabs that actually depend on it (e.g. a Treasury-yield
 outage blanks Rates, Rate Environment and Credit, but Inflation, Labor, News and
-Calendar still render; before, it blanked all seven). Only `_StopTab` is
-swallowed — an unexpected exception inside a tab still halts the script and
-blanks the tabs after it. Side effect: in a total FRED outage every tab now
+Calendar still render; before, it blanked all seven). `_StopTab` is
+swallowed silently; any other exception inside a tab is caught by `_tab()` and
+shown in that tab via `st.exception()`, so later tabs still render (Streamlit's
+own `st.stop`/rerun exceptions are `BaseException`, so they pass through).
+Side effect: in a total FRED outage every tab now
 attempts its own fetch and shows its own error, rather than the first tab's
 failure short-circuiting the rest.
 
@@ -131,9 +133,11 @@ kind of environment they're in. Three sections, rendered by
    to ACCOMMODATIVE / CALM (strict `>`). If MOVE fails or doesn't overlap the
    period it falls back to a ⚠️ caption plus the 10Y line against its 4.00%
    threshold (no vol axis).
-2. **Rate volatility** — MOVE (implied, left axis) and 20-observation realized
-   10Y vol (annualized bp, right axis) via `make_subplots`; separate axes because
-   the units differ. Pills key `vol_series` (`_VOL_SPEC` ↔ `theme._PILL_TINTS`).
+2. **Rate volatility** — MOVE (implied) and 20-observation realized 10Y vol
+   (annualized bp) on **one shared y-axis** (both are basis-point vols, so the gap
+   between the lines is a real implied-vs-realized gap; the range spans both series
+   so toggling a pill doesn't rescale). Pills key `vol_series` (`_VOL_SPEC` ↔
+   `theme._PILL_TINTS`).
 3. **Term premium** — `THREEFYTP10` with a zero reference line; the sign is the read.
 
 ## UI conventions
