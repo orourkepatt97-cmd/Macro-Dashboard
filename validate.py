@@ -16,10 +16,12 @@ a number specific to one series baked into this script.
                    from raw observations fetched directly (not via
                    data.fetch_series) and compared; any disagreement is an
                    error.
-    Shape        — for the one non-FRED scrape that has no second source
-                   (MOVE via Yahoo/yfinance): a plausible count of recent
-                   observations, fresh latest date, no multi-day silences,
-                   values in a sane range — a partial or empty return FAILS.
+    Shape        — for the non-FRED sources with no second copy (MOVE via
+                   Yahoo/yfinance; the FX tab's BIS policy rates and BCRP
+                   Peruvian-sol rate): a plausible count of recent observations,
+                   fresh latest date, no multi-day silences, values in a sane
+                   range — a partial or empty return FAILS. The FX tab's whole
+                   carry table is also recomputed from raw fetches of its own.
     Cross-source — FRED's DGS yields against the Fed's own H.15 release CSV;
                    the Cleveland Fed nowcast feed against its own published
                    page (same origin, so this is a reachability/recency check,
@@ -54,11 +56,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import calendar
+import csv
 import inspect
 import io
 import json
 import math
+import re
 import sys
+import time
+from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -109,6 +116,18 @@ _LAG_BUDGET_OVERRIDES: dict[str, tuple[int, str]] = {
         "legitimately up to ~7 days old; this job runs Mondays, when it's ~6",
     ),
 }
+# The Fed's H.10 (foreign exchange rates) is a weekly release: FRED's vintage
+# dates for these series are every Monday (occasionally Tuesday) with the prior
+# week's daily rates, so last_updated is legitimately up to ~7 days old and the
+# generic daily budget would fail them every Friday. Same evidence as above.
+for _pair in data.FX_PAIRS:
+    if _pair.spot_id:
+        _LAG_BUDGET_OVERRIDES[_pair.spot_id] = (
+            9,  # a 7-day cadence plus 2 days of slack
+            "daily observations, but FRED publishes the Fed's H.10 exchange rates in a "
+            "weekly batch (vintage dates are consecutive Mondays), so last_updated is "
+            "legitimately up to ~7 days old",
+        )
 
 # MOVE shape check (Yahoo Finance ^MOVE via yfinance — see check_move_shape()).
 _MOVE_WINDOW_DAYS = 90          # "recent" = the last 90 calendar days (~61 sessions)
@@ -156,6 +175,29 @@ _KNOWN_GAPS: dict[str, dict[str, object]] = {
                   "Employment Situation release).",
     },
 }
+
+# FX tab: BIS policy rates + BCRP Peruvian sol (see transform_checks_fx()).
+_BIS_MAX_AGE_DAYS = 21          # BIS runs ~a week behind; an area quiet for 3 weeks is broken
+_BIS_MAX_SILENCE_DAYS = 7       # longest gap between consecutive observations, last 90d
+_BIS_RATE_BAND = (-1.0, 60.0)   # percent: sane range for any policy rate
+_PEN_MIN_RECENT_OBS = 15        # of ~21 business days in 30 calendar days
+_PEN_MAX_AGE_DAYS = 7
+_PEN_MAX_SILENCE_DAYS = 5
+_FX_CHANGE_TOL = 0.0051         # the table rounds changes to 2dp, so allow half a unit of the last place
+# BIS policy rate vs FRED's monthly call-money series for the same country,
+# compared as a month average. They are different measures (a target vs an
+# actual overnight rate), so this is a "same ballpark" check that catches a wrong
+# country, scale, or stale feed, not an exact tie-out.
+_BIS_VS_FRED_RATE = {
+    "JP": "IRSTCI01JPM156N", "CA": "IRSTCI01CAM156N", "AU": "IRSTCI01AUM156N",
+    "BR": "IRSTCI01BRM156N", "GB": "IRSTCI01GBM156N", "MX": "IRSTCI01MXM156N",
+}
+_BIS_VS_FRED_TOL = 0.25         # percentage points
+# Mexico is checked but reported as a KNOWN exception when it disagrees: as of
+# this writing BIS's MX policy rate sits a persistent ~1.3pp above FRED's MX
+# call-money series (month averages, every month of 2026), unlike the other five
+# countries, which agree within 0.06pp. Unresolved which is right — see CLAUDE.md.
+_BIS_VS_FRED_KNOWN_DIFFERENT = {"MX"}
 
 FRED_OBS_URL = "https://api.stlouisfed.org/fred/series/observations"
 FRED_SERIES_URL = "https://api.stlouisfed.org/fred/series"
@@ -229,12 +271,23 @@ def section(title: str) -> None:
 # that function's request construction or parsing can't hide from this script.
 # --------------------------------------------------------------------------
 
+def _fred_get(url: str, params: dict) -> requests.Response:
+    """GET against FRED, backing off and retrying on HTTP 429 (its ~120
+    requests/minute limit — a full run makes enough calls to brush against it,
+    and an unretried 429 would show up as a spurious "no data" failure)."""
+    for attempt in range(5):
+        resp = requests.get(url, params=params, timeout=_TIMEOUT)
+        if resp.status_code != 429:
+            return resp
+        time.sleep(5 * (attempt + 1))
+    return resp
+
+
 def fred_meta(series_id: str) -> dict | None:
     try:
-        resp = requests.get(
+        resp = _fred_get(
             FRED_SERIES_URL,
-            params={"series_id": series_id, "api_key": data.FRED_API_KEY, "file_type": "json"},
-            timeout=_TIMEOUT,
+            {"series_id": series_id, "api_key": data.FRED_API_KEY, "file_type": "json"},
         )
         resp.raise_for_status()
         seriess = resp.json().get("seriess", [])
@@ -246,13 +299,12 @@ def fred_meta(series_id: str) -> dict | None:
 def fred_obs(series_id: str, start: str, end: str) -> pd.Series | None:
     """Raw observations, independently fetched and parsed (own code path)."""
     try:
-        resp = requests.get(
+        resp = _fred_get(
             FRED_OBS_URL,
-            params={
+            {
                 "series_id": series_id, "api_key": data.FRED_API_KEY,
                 "file_type": "json", "observation_start": start, "observation_end": end,
             },
-            timeout=_TIMEOUT,
         )
         resp.raise_for_status()
         rows = resp.json().get("observations", [])
@@ -575,6 +627,381 @@ def transform_checks_realized_vol(today: pd.Timestamp) -> None:
               f"independent={expected.loc[worst]:.4f}bp")
 
 
+# --------------------------------------------------------------------------
+# FX tab — independent recomputation, feed shape, cross-source
+# --------------------------------------------------------------------------
+
+_BCRP_MONTH_NUM = {m: i for i, m in enumerate(
+    ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Set", "Oct", "Nov", "Dic"], start=1)}
+
+
+def _months_back(day: pd.Timestamp, months: int) -> pd.Timestamp:
+    """Same day-of-month ``months`` earlier, clamped to the month's last day —
+    stdlib calendar arithmetic, not pandas DateOffset."""
+    index = day.year * 12 + (day.month - 1) - months
+    year, month = divmod(index, 12)
+    month += 1
+    return pd.Timestamp(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _raw_bcrp_pen(start: str, end: str) -> list[tuple[pd.Timestamp, float]] | None:
+    """Peruvian sol per USD straight from BCRP, parsed with a regex over the raw
+    text (data.py parses the JSON) so a parsing bug can't be mirrored here."""
+    url = f"{data.BCRP_PEN_URL}/{start}/{end}"
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        try:
+            text = requests.get(url, timeout=_TIMEOUT).text
+        except requests.RequestException:
+            continue
+        rows = re.findall(r'"name":"(\d{2})\.([A-Za-z]{3})\.(\d{2})",\s*"values":\["([^"]*)"\]', text)
+        if not rows:
+            continue
+        out: dict[pd.Timestamp, float] = {}
+        for day, month, year, value in rows:
+            if month not in _BCRP_MONTH_NUM:
+                return None
+            try:
+                out[pd.Timestamp(2000 + int(year), _BCRP_MONTH_NUM[month], int(day))] = float(value)
+            except ValueError:
+                continue                      # "n.d." — no data that day
+        return sorted(out.items())
+    return None
+
+
+def check_fx_live(today: pd.Timestamp, app_spot: pd.DataFrame, app_rates: pd.DataFrame) -> None:
+    """The FX table's live prices (Yahoo hourly bars): fetched here with a
+    different yfinance call (per-ticker ``Ticker.history``, not the app's batch
+    ``download``), reference prices recomputed with plain loops, shape-checked,
+    and cross-checked against the settled H.10 rates. A GitHub runner may be
+    blocked by Yahoo (same environmental caveat as MOVE)."""
+    section("FX tab — live prices (Yahoo hourly bars)")
+    live, note = data.fetch_fx_live()
+    if not check("FX live: fetch returned data", note is None and not live.empty,
+                 "" if note is None and not live.empty else (note or "empty frame")):
+        return
+    try:
+        import yfinance as yf
+    except ImportError:
+        check("FX live: yfinance importable for independent fetch", False, "not installed")
+        return
+
+    table = data.carry_table(app_spot, app_rates, live)
+    for ccy, ticker in data.YAHOO_FX_TICKERS.items():
+        pair = next(p for p in data.FX_PAIRS if p.ccy == ccy)
+        try:
+            hist = yf.Ticker(ticker).history(period="2mo", interval="1h", auto_adjust=False, timeout=20)
+            bars = [(ts.tz_convert("UTC"), float(v)) for ts, v in hist["Close"].dropna().items() if v > 0]
+        except Exception as exc:  # noqa: BLE001
+            check(f"FX live {ccy}: independent hourly fetch", False, f"{type(exc).__name__}: {exc}")
+            continue
+        bars.sort()
+        if not bars:
+            check(f"FX live {ccy}: independent hourly fetch returned bars", False, "no bars")
+            continue
+
+        # shape: enough bars, fresh, no multi-day silences (weekends excepted), sane values
+        stamps = [t for t, _ in bars]
+        age = pd.Timestamp.now(tz="UTC") - stamps[-1]
+        silences = [(a.date(), b.date()) for a, b in zip(stamps, stamps[1:]) if (b - a) > pd.Timedelta(days=4)]
+        check(f"FX live {ccy}: >= 200 hourly bars in 2 months, latest within 5 days, no silences > 4 days",
+              len(bars) >= 200 and age <= pd.Timedelta(days=5) and not silences,
+              f"{len(bars)} bars, latest {stamps[-1]:%Y-%m-%d %H:%M} UTC ({age.days}d {age.seconds // 3600}h old)"
+              + (f"; silences: {silences[:3]}" if silences else ""))
+
+        # reference prices: last bar on or before 24h / 1 month earlier (plain loops + bisect)
+        times = [t for t, _ in bars]
+        last_t, last_p = bars[-1]
+        refs = []
+        for target in (last_t - pd.Timedelta(hours=24), _months_back(last_t.tz_convert(None), 1).tz_localize("UTC")
+                       + pd.Timedelta(hours=last_t.hour, minutes=last_t.minute, seconds=last_t.second)):
+            pos = bisect_right(times, target) - 1
+            refs.append(bars[pos][1] if pos >= 0 else float("nan"))
+        # the reference must be a genuinely different, earlier bar (not the live bar itself),
+        # and the feed must not be a frozen tick: >= 2 distinct values in the last 6 bars
+        ref_gap = last_t - times[bisect_right(times, last_t - pd.Timedelta(hours=24)) - 1] \
+            if bisect_right(times, last_t - pd.Timedelta(hours=24)) > 0 else None
+        distinct = len({round(v, 8) for _, v in bars[-6:]})
+        check(f"FX live {ccy}: 24h reference is an earlier bar (12-96h before) and the feed is not a frozen tick",
+              ref_gap is not None and pd.Timedelta(hours=12) <= ref_gap <= pd.Timedelta(hours=96) and distinct >= 2,
+              f"reference gap {ref_gap}, {distinct} distinct values in the last 6 bars")
+        got = live.loc[ccy] if ccy in live.index else None
+        if got is None:
+            check(f"FX live {ccy}: present in the app's live frame", False, "dropped by the app (stale/implausible)")
+            continue
+        problems = []
+        # the two ends of each change are historical bars, so they must agree exactly;
+        # the live price itself moves between two fetches, so allow a small gap
+        for name, ours, theirs in (("Ref1D", got["Ref1D"], refs[0]), ("Ref1M", got["Ref1M"], refs[1])):
+            if not (math.isnan(theirs) and pd.isna(ours)) and not abs(ours - theirs) < 1e-9:
+                problems.append(f"{name} app={ours} independent={theirs}")
+        if abs(got["Price"] / last_p - 1.0) > 0.005:
+            problems.append(f"Price app={got['Price']} independent={last_p} (>0.5% apart)")
+        check(f"FX live {ccy}: reference prices (24h, 1 month) match independent recomputation; "
+              f"live price within 0.5% of a fresh fetch", not problems, "; ".join(problems))
+
+        # the table's 1D / 1M follow the formula from the app's own price and the independent refs
+        row = table.loc[pair.pair]
+        bad = []
+        for col, ref in (("1D %", refs[0]), ("1M %", refs[1])):
+            if math.isnan(ref):
+                continue
+            exp = ((got["Price"] / ref - 1.0) if pair.usd_per_fc else (ref / got["Price"] - 1.0)) * 100.0
+            if not abs(exp - row[col]) <= _FX_CHANGE_TOL:
+                bad.append(f"{col} table={row[col]} independent={exp:.4f}")
+        if abs(row["Spot"] - got["Price"]) > 1e-9:
+            bad.append(f"Spot table={row['Spot']} live={got['Price']}")
+        check(f"FX live {pair.pair}: table spot, 1D and 1M follow from the live price and references",
+              not bad, "; ".join(bad))
+
+        # cross-check against the settled H.10 series: catches a mis-scaled or inverted Yahoo ticker
+        settled = app_spot[ccy].dropna() if ccy in app_spot else pd.Series(dtype="float64")
+        if not settled.empty:
+            gap = abs(got["Price"] / float(settled.iloc[-1]) - 1.0)
+            check(f"FX live {ccy}: live price within {data._FX_LIVE_MAX_GAP:.0%} of the last settled H.10 rate "
+                  f"({settled.index[-1]:%b %d})", gap <= data._FX_LIVE_MAX_GAP,
+                  f"live={got['Price']:.4f} settled={float(settled.iloc[-1]):.4f} ({gap:.1%} apart)")
+            # same-hour comparison: Yahoo's noon-NY bar vs that day's H.10 fix, which should agree closely
+            noon = [(t, v) for t, v in bars if t.tz_convert("America/New_York").hour == 12]
+            diffs = []
+            for t, v in noon:
+                day = t.tz_convert("America/New_York").tz_localize(None).normalize()
+                if day in settled.index:
+                    diffs.append(abs(v / float(settled.loc[day]) - 1.0))
+            if diffs:
+                check(f"FX live {ccy}: Yahoo noon-NY bars agree with H.10 fixes (<= 1.5% each, {len(diffs)} days)",
+                      max(diffs) <= 0.015, f"worst {max(diffs):.2%}, mean {sum(diffs) / len(diffs):.2%}")
+
+
+def _bcrp_series_name() -> str | None:
+    """The series name BCRP itself reports for PD04638PD (its units are in the name)."""
+    url = f"{data.BCRP_PEN_URL}/{(pd.Timestamp.today() - pd.Timedelta(days=10)):%Y-%m-%d}/{pd.Timestamp.today():%Y-%m-%d}"
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        try:
+            found = re.search(r'"name":"(Tipo de cambio[^"]*)"', requests.get(url, timeout=_TIMEOUT).text)
+        except requests.RequestException:
+            continue
+        if found:
+            return found.group(1)
+    return None
+
+
+def _raw_bis_policy(areas: list[str], start: str) -> dict[str, list[tuple[pd.Timestamp, float]]] | None:
+    """BIS central-bank policy rates by area, read with the csv module."""
+    url = data.BIS_POLICY_URL + "+".join(areas)
+    try:
+        resp = requests.get(
+            url, params={"startPeriod": start, "detail": "dataonly"}, timeout=45,
+            headers={"Accept": "application/vnd.sdmx.data+csv;version=1.0.0"},
+        )
+        resp.raise_for_status()
+    except requests.RequestException:
+        return None
+    out: dict[str, dict[pd.Timestamp, float]] = {}
+    for row in csv.DictReader(io.StringIO(resp.text)):
+        try:
+            value = float(row["OBS_VALUE"])
+            if not math.isfinite(value):
+                continue                      # a missing-value marker (e.g. "NaN")
+            out.setdefault(row["REF_AREA"], {})[pd.Timestamp(row["TIME_PERIOD"])] = value
+        except (KeyError, ValueError):
+            continue
+    return {area: sorted(obs.items()) for area, obs in out.items()}
+
+
+def _on_or_before(rows: list[tuple[pd.Timestamp, float]], target: pd.Timestamp) -> float | None:
+    """The value of the last (date, value) row dated on or before ``target``."""
+    pos = bisect_right([d for d, _ in rows], target) - 1
+    return rows[pos][1] if pos >= 0 else None
+
+
+def _independent_fx_row(rows: list[tuple[pd.Timestamp, float]], usd_per_fc: bool) -> dict[str, float]:
+    """Latest level, 1D / 1M % change of the foreign currency vs the USD, and
+    63-observation realized vol — plain loops, bisect and math.log."""
+    asof, latest = rows[-1]
+    out: dict[str, float] = {"Spot": latest}
+    for key, target in (("1D %", asof - pd.Timedelta(days=1)), ("1M %", _months_back(asof, 1))):
+        before = _on_or_before(rows, target)
+        out[key] = float("nan") if before is None else (
+            ((latest / before - 1.0) if usd_per_fc else (before / latest - 1.0)) * 100.0)
+    window = [v for _, v in rows[-(data.FX_VOL_DAYS + 1):]]
+    if len(window) == data.FX_VOL_DAYS + 1:
+        rets = [math.log(window[i] / window[i - 1]) for i in range(1, len(window))]
+        mean = sum(rets) / len(rets)
+        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        out["Vol %"] = math.sqrt(var) * math.sqrt(252) * 100.0
+    else:
+        out["Vol %"] = float("nan")
+    return out
+
+
+def transform_checks_fx(today: pd.Timestamp) -> dict[str, pd.Series]:
+    """Recompute the FX tab's carry table from raw sources fetched here and
+    compare it with data.carry_table() over the same data the app uses; shape-
+    check the BIS and BCRP feeds; cross-check BIS policy rates against FRED.
+    Returns the PEN history (for the generic own-history sanity bounds)."""
+    section("FX tab — independent recomputation, feed shape, cross-source")
+    start = (today - pd.DateOffset(months=14)).strftime("%Y-%m-%d")
+    end = today.strftime("%Y-%m-%d")
+
+    app_spot, app_rates, notes = data.fetch_fx_window()
+    check("FX: app fetch returned spot and policy rates without notes",
+          not notes and not app_spot.empty and not app_rates.empty, "; ".join(notes))
+    table = data.carry_table(app_spot, app_rates)
+    check_fx_live(today, app_spot, app_rates)
+
+    # --- raw sources, fetched independently -------------------------------------------
+    raw: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    for pair in data.FX_PAIRS:
+        if pair.spot_id:
+            series = fred_obs(pair.spot_id, start, end)
+            rows = [] if series is None else list(zip(series.index, series.tolist()))
+        else:
+            rows = _raw_bcrp_pen(start, end) or []
+        if check(f"FX {pair.ccy}: raw spot fetched for recomputation", bool(rows),
+                 "" if rows else "fetch failed or empty"):
+            raw[pair.ccy] = rows
+
+    areas = [data.FX_USD_AREA, *(p.area for p in data.FX_PAIRS)]
+    bis = _raw_bis_policy(areas, start)
+    if not check("FX: raw BIS policy rates fetched", bool(bis), "" if bis else "fetch failed or empty"):
+        bis = {}
+
+    # --- recomputation vs the app's table -----------------------------------------------
+    us_rows = bis.get(data.FX_USD_AREA, [])
+    us_latest = us_rows[-1][1] if us_rows else float("nan")
+    for pair in data.FX_PAIRS:
+        if pair.ccy not in raw:
+            continue
+        exp = _independent_fx_row(raw[pair.ccy], pair.usd_per_fc)
+        got = table.loc[pair.pair]
+        problems = []
+        if abs(exp["Spot"] - got["Spot"]) > 1e-9:
+            problems.append(f"Spot app={got['Spot']} independent={exp['Spot']}")
+        for key in ("1D %", "1M %"):
+            if not (math.isnan(exp[key]) and pd.isna(got[key])) and not abs(exp[key] - got[key]) <= _FX_CHANGE_TOL:
+                problems.append(f"{key} app={got[key]} independent={exp[key]:.4f}")
+        if not (math.isnan(exp["Vol %"]) and pd.isna(got["Vol %"])) and not abs(exp["Vol %"] - got["Vol %"]) < 1e-6:
+            problems.append(f"Vol % app={got['Vol %']:.6f} independent={exp['Vol %']:.6f}")
+        if raw[pair.ccy][-1][0] != got["Spot as of"]:
+            problems.append(f"Spot as of app={got['Spot as of']} independent={raw[pair.ccy][-1][0]}")
+        check(f"FX {pair.pair}: spot, 1D/1M change and 63d realized vol match independent recomputation",
+              not problems, "; ".join(problems))
+
+        rate_rows = bis.get(pair.area, [])
+        if rate_rows and not math.isnan(us_latest):
+            vs = round(rate_rows[-1][1] - us_latest, 4)
+            exp_cv = vs / exp["Vol %"] if exp["Vol %"] > 0 else float("nan")
+            bad = []
+            if abs(rate_rows[-1][1] - got["Rate %"]) > 1e-9:
+                bad.append(f"Rate app={got['Rate %']} independent={rate_rows[-1][1]}")
+            if abs(vs - got["vs USD"]) > 1e-9:
+                bad.append(f"vs USD app={got['vs USD']} independent={vs}")
+            if not (math.isnan(exp_cv) and pd.isna(got["Carry/vol"])) and not abs(exp_cv - got["Carry/vol"]) < 1e-6:
+                bad.append(f"Carry/vol app={got['Carry/vol']} independent={exp_cv}")
+            check(f"FX {pair.pair}: policy rate, differential vs USD and carry/vol match independent recomputation",
+                  not bad, "; ".join(bad))
+
+    # --- quote orientation, read from the sources' own labels --------------------------
+    # The recomputation above reuses FxPair.usd_per_fc, so a wrong flag would be
+    # mirrored, not caught. The flag decides the sign of every 1D/1M change, so check
+    # it against what each source says its series is.
+    for pair in data.FX_PAIRS:
+        if pair.spot_id:
+            meta = fred_meta(pair.spot_id)
+            title = (meta or {}).get("title", "")
+            says_usd_per_fc = title.startswith("U.S. Dollars to ")
+            says_fc_per_usd = title.endswith(" to U.S. Dollar") or " to U.S. Dollar " in title
+            ok = meta is not None and (says_usd_per_fc != says_fc_per_usd) and says_usd_per_fc == pair.usd_per_fc
+            check(f"FX {pair.ccy}: FRED {pair.spot_id} is quoted "
+                  f"{'USD per ' if pair.usd_per_fc else ''}{pair.ccy}{'' if pair.usd_per_fc else ' per USD'}, as the tab assumes",
+                  ok, f"FRED title: {title!r}, tab assumes usd_per_fc={pair.usd_per_fc}")
+        else:
+            name = _bcrp_series_name()
+            ok = name is not None and "S/ por US$" in name and not pair.usd_per_fc
+            check(f"FX {pair.ccy}: BCRP series is soles per US$, as the tab assumes", ok,
+                  f"BCRP name: {name!r}, tab assumes usd_per_fc={pair.usd_per_fc}")
+
+    # --- BIS feed shape -------------------------------------------------------------------
+    missing = [a for a in areas if a not in bis]
+    check("BIS: every requested country returned data", not missing,
+          f"missing: {', '.join(missing)}" if missing else "")
+    for area, rows in bis.items():
+        age = (today - rows[-1][0]).days
+        recent = [(d, v) for d, v in rows if d >= today - pd.Timedelta(days=90)]
+        gaps = [(a[0].date(), b[0].date()) for a, b in zip(recent, recent[1:])
+                if (b[0] - a[0]).days > _BIS_MAX_SILENCE_DAYS]
+        lo, hi = _BIS_RATE_BAND
+        ok = (age <= _BIS_MAX_AGE_DAYS and not gaps and len([1 for d, _ in rows if d >= today - pd.Timedelta(days=30)]) >= 10
+              and lo <= rows[-1][1] <= hi)
+        check(f"BIS {area}: fresh (<= {_BIS_MAX_AGE_DAYS}d), no silences > {_BIS_MAX_SILENCE_DAYS}d, "
+              f"sane rate in [{lo:g}, {hi:g}]", ok,
+              f"latest {rows[-1][0].date()} = {rows[-1][1]:g} ({age}d old)"
+              + (f"; silences: {gaps[:3]}" if gaps else ""))
+
+    # --- BIS vs FRED ----------------------------------------------------------------------
+    def _fred_on_or_before(series_id: str, day: pd.Timestamp) -> float | None:
+        series = fred_obs(series_id, (day - pd.Timedelta(days=14)).strftime("%Y-%m-%d"),
+                          (day + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+        return None if series is None or series.empty else _on_or_before(
+            list(zip(series.index, series.tolist())), day)
+
+    if bis.get("XM"):
+        day, value = bis["XM"][-1]
+        ecb = _fred_on_or_before("ECBDFR", day)
+        check(f"BIS XM vs FRED ECBDFR on {day.date()}: ECB deposit facility rate agrees",
+              ecb is not None and abs(ecb - value) <= 0.01, f"BIS={value:g} FRED={ecb}")
+    if us_rows:
+        day, value = us_rows[-1]
+        upper, lower = _fred_on_or_before("DFEDTARU", day), _fred_on_or_before("DFEDTARL", day)
+        mid = None if upper is None or lower is None else (upper + lower) / 2.0
+        check(f"BIS US vs FRED DFEDTARU/DFEDTARL on {day.date()}: BIS is the mid-point of the Fed target range",
+              mid is not None and abs(mid - value) <= 0.01, f"BIS={value:g} FRED mid-point={mid}")
+
+    for area, fred_id in _BIS_VS_FRED_RATE.items():
+        rows = bis.get(area)
+        fred = fred_obs(fred_id, (today - pd.DateOffset(months=5)).strftime("%Y-%m-%d"), end)
+        if not rows or fred is None or fred.empty:
+            check(f"BIS {area} vs FRED {fred_id}: both sources available", False, "one side empty")
+            continue
+        month = fred.index[-1]
+        in_month = [v for d, v in rows if d.year == month.year and d.month == month.month]
+        if len(in_month) < 5:
+            check(f"BIS {area} vs FRED {fred_id}: BIS has data for {month:%b %Y}", False,
+                  f"{len(in_month)} observations")
+            continue
+        avg = sum(in_month) / len(in_month)
+        diff = avg - float(fred.iloc[-1])
+        label = (f"BIS {area} vs FRED {fred_id} ({month:%b %Y} average): within "
+                 f"{_BIS_VS_FRED_TOL:g}pp")
+        detail = f"BIS avg={avg:.3f} FRED={float(fred.iloc[-1]):.3f} diff={diff:+.3f}pp"
+        if abs(diff) <= _BIS_VS_FRED_TOL:
+            check(label, True, detail)
+        elif area in _BIS_VS_FRED_KNOWN_DIFFERENT:
+            known(label, f"{detail} — persistent across 2026, cause unresolved; the tab uses BIS")
+        else:
+            check(label, False, detail)
+
+    # --- BCRP shape ---------------------------------------------------------------------------
+    pen = raw.get("PEN")
+    if pen:
+        recent = [(d, v) for d, v in pen if d >= today - pd.Timedelta(days=30)]
+        age = (today - pen[-1][0]).days
+        gaps = [(a[0].date(), b[0].date()) for a, b in zip(pen[-60:], pen[-59:])
+                if (b[0] - a[0]).days > _PEN_MAX_SILENCE_DAYS]
+        check(f"BCRP PEN: >= {_PEN_MIN_RECENT_OBS} observations in the last 30d, latest within "
+              f"{_PEN_MAX_AGE_DAYS}d, no silences > {_PEN_MAX_SILENCE_DAYS}d, all values positive",
+              len(recent) >= _PEN_MIN_RECENT_OBS and age <= _PEN_MAX_AGE_DAYS and not gaps
+              and all(v > 0 for _, v in pen),
+              f"{len(recent)} recent observations, latest {pen[-1][0].date()} ({age}d old)"
+              + (f"; silences: {gaps[:3]}" if gaps else ""))
+        return {"PEN": pd.Series([v for _, v in pen], index=pd.DatetimeIndex([d for d, _ in pen]))}
+    return {}
+
+
 def check_move_shape(today: pd.Timestamp) -> pd.Series | None:
     """Shape check on data.move_index() (Yahoo Finance ^MOVE via yfinance, an
     unofficial scrape). A partial or empty return must FAIL, not pass silently:
@@ -895,6 +1322,9 @@ def all_series() -> dict[str, str]:
         out[sid] = label
     for sid, label in data.RATE_ENV_SERIES.items():
         out[sid] = label
+    for pair in data.FX_PAIRS:
+        if pair.spot_id:
+            out[pair.spot_id] = f"{pair.pair} spot"
     return out
 
 
@@ -924,6 +1354,7 @@ def main() -> int:
     transform_checks_spreads(today)
     transform_checks_rolling(today)
     transform_checks_realized_vol(today)
+    histories.update(transform_checks_fx(today))   # PEN joins the own-history sanity bounds
 
     move_history = check_move_shape(today)
     if move_history is not None:

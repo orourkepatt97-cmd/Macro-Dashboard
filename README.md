@@ -2,8 +2,9 @@
 
 Streamlit dashboard for the US Treasury curve (3M / 2Y / 5Y / 10Y / 30Y), curve
 spreads, rate regime and volatility, credit spreads, inflation, labor, and an
-economic calendar — sourced from [FRED](https://fred.stlouisfed.org/), with
-Fed-decision odds from Kalshi, the MOVE index from Yahoo Finance, and market news
+economic calendar, and FX carry — sourced from [FRED](https://fred.stlouisfed.org/), with
+Fed-decision odds from Kalshi, the MOVE index from Yahoo Finance, central-bank policy
+rates from the BIS, the Peruvian sol from Peru's central bank, and market news
 from RSS. Live at https://macro-terminal.streamlit.app/. See `CLAUDE.md` for the
 detailed engineering briefing.
 
@@ -38,7 +39,7 @@ python validate.py   # optional: audit the data pipeline (--quiet for CI)
 
 ## Features
 
-Tabs, in order: Rates · Rate Environment · Inflation · Labor · Credit · News ·
+Tabs, in order: Rates · Rate Environment · Inflation · Labor · Credit · FX · News ·
 Calendar.
 
 **Controls (top of page)**
@@ -80,6 +81,17 @@ Calendar.
   1D / 1W / 1M change in bps (fixed ~5-month window, independent of the selected
   range).
 - HY OAS vs the 2s10s spread on a dual axis — credit and curve on one chart.
+
+**FX tab**
+
+- **Spot and carry table:** EUR, JPY, GBP, AUD, CHF, CAD (G10) and MXN, BRL, PEN (EM),
+  each with the spot rate (market-convention quote), 1-day and 1-month change in the
+  foreign currency's value against the USD, the country's policy rate, carry (local policy rate minus the US
+  rate), 3-month realized FX vol, and carry/vol, sorted by carry/vol within each group.
+- **Carry vs volatility:** scatter of carry against vol, one labelled point per currency.
+- Sources: live spot and 1D/1M changes from Yahoo Finance hourly prices (falling back
+  to the Fed's H.10 rates on FRED if Yahoo is unavailable), Peru's central bank (PEN),
+  and the BIS (policy rates, about a week behind).
 
 **Inflation tab**
 

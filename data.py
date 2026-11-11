@@ -7,9 +7,12 @@ directly.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -148,6 +151,13 @@ def fetch_series(series_id: str, start_date: str, end_date: str) -> pd.Series:
 
     try:
         response = requests.get(FRED_BASE_URL, params=params, timeout=30)
+        # FRED allows ~120 requests/minute; a cold page load with every tab's
+        # series can brush against it, so back off briefly on HTTP 429.
+        for delay in (2, 5):
+            if response.status_code != 429:
+                break
+            time.sleep(delay)
+            response = requests.get(FRED_BASE_URL, params=params, timeout=30)
     except requests.RequestException as exc:  # network error, DNS, timeout
         raise FredAPIError(f"Could not reach FRED: {exc}") from exc
 
@@ -792,6 +802,352 @@ def term_premium(start_date: str, end_date: str) -> pd.Series:
     return fetch_series(TERM_PREMIUM_SERIES, start_date, end_date)
 
 
+# ---------------------------------------------------------------------------
+# FX tab: spot rates + central-bank policy rates (carry)
+# ---------------------------------------------------------------------------
+# Spot: FRED's H.10 series (the Fed's noon-NY buying rates, about 3 business
+# days behind) for eight currencies; the Peruvian sol is not in H.10, so it
+# comes from Peru's central bank (BCRP) API. Policy rates: the BIS's central-
+# bank policy-rate dataset (WS_CBPOL), one source for every country, daily,
+# about a week behind. BIS "US" is the mid-point of the Fed's target range;
+# "XM" is the ECB deposit facility rate.
+BIS_POLICY_URL = "https://stats.bis.org/api/v2/data/dataflow/BIS/WS_CBPOL/1.0/D."
+BCRP_PEN_URL = "https://estadisticas.bcrp.gob.pe/estadisticas/series/api/PD04638PD/json"
+FX_VOL_DAYS = 63                    # ~3 months of observations for realized FX vol
+FX_CHANGE_KEYS = ("1D", "1M")
+
+
+@dataclass(frozen=True)
+class FxPair:
+    ccy: str            # ISO code; also the spot-frame column
+    pair: str           # market-convention label
+    spot_id: str | None  # FRED series id; None = BCRP (PEN)
+    usd_per_fc: bool    # True: the quote is USD per 1 FC (EUR/USD); False: FC per USD
+    area: str           # BIS REF_AREA code for the policy rate
+    decimals: int       # display precision for the spot level
+    group: str = "G10"  # "G10" or "EM" — how the FX tab groups the rows
+
+
+# The user's order. Quote conventions are the FRED/market ones as published —
+# series are never re-inverted, so a displayed level is exactly the source value.
+FX_PAIRS: tuple[FxPair, ...] = (
+    FxPair("EUR", "EUR/USD", "DEXUSEU", True, "XM", 4),
+    FxPair("JPY", "USD/JPY", "DEXJPUS", False, "JP", 2),
+    FxPair("GBP", "GBP/USD", "DEXUSUK", True, "GB", 4),
+    FxPair("MXN", "USD/MXN", "DEXMXUS", False, "MX", 4, "EM"),
+    FxPair("PEN", "USD/PEN", None, False, "PE", 4, "EM"),
+    FxPair("BRL", "USD/BRL", "DEXBZUS", False, "BR", 4, "EM"),
+    FxPair("AUD", "AUD/USD", "DEXUSAL", True, "AU", 4),
+    FxPair("CHF", "USD/CHF", "DEXSZUS", False, "CH", 4),
+    FxPair("CAD", "USD/CAD", "DEXCAUS", False, "CA", 4),
+)
+FX_USD_AREA = "US"
+FX_GROUPS = ("G10", "EM")
+
+_BCRP_MONTHS = {
+    "Ene": 1, "Feb": 2, "Mar": 3, "Abr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Ago": 8, "Set": 9, "Oct": 10, "Nov": 11, "Dic": 12,
+}
+
+
+class FxSourceError(RuntimeError):
+    """A non-FRED FX source (BIS / BCRP) failed or returned something unreadable."""
+
+
+def _parse_bcrp_pen(payload: dict) -> pd.Series:
+    """BCRP's JSON -> a date-indexed float Series (soles per USD, interbank
+    sell rate). Period names look like ``"09.Nov.26"`` (Spanish month
+    abbreviation, two-digit year); ``"n.d."`` marks a day with no data. An
+    unrecognised month raises rather than silently mis-dating a point."""
+    dates, values = [], []
+    for period in payload.get("periods", []):
+        day, month, year = str(period["name"]).split(".")
+        if month not in _BCRP_MONTHS:
+            raise FxSourceError(f"unrecognised month {month!r} in BCRP data")
+        try:
+            value = float(period["values"][0])
+        except (TypeError, ValueError, IndexError):
+            continue
+        dates.append(pd.Timestamp(2000 + int(year), _BCRP_MONTHS[month], int(day)))
+        values.append(value)
+    series = pd.Series(values, index=pd.DatetimeIndex(dates), dtype="float64", name="PEN")
+    series = series[~series.index.duplicated(keep="last")].sort_index()
+    series.index.name = "date"
+    return series
+
+
+def _fetch_pen_spot(start_date: str, end_date: str) -> pd.Series:
+    """Peruvian sol per USD from BCRP. The API occasionally answers with an
+    anti-bot HTML page instead of JSON, so retry a couple of times."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1.5)
+        try:
+            response = requests.get(f"{BCRP_PEN_URL}/{start_date}/{end_date}", timeout=30)
+            response.raise_for_status()
+            series = _parse_bcrp_pen(json.loads(response.text))
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            last_error = exc
+            continue
+        if not series.empty:
+            return series
+        last_error = FxSourceError("no observations")
+    raise FxSourceError(f"BCRP request failed ({type(last_error).__name__})")
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner="Fetching FX rates…")
+def fetch_fx_spot(start_date: str, end_date: str) -> tuple[pd.DataFrame, list[str]]:
+    """``(frame, notes)`` — one column per :data:`FX_PAIRS` ``ccy`` in the
+    pair's native quote (see ``usd_per_fc``). A source that fails drops only its
+    own column and adds a short note, so one outage degrades one row."""
+    columns: dict[str, pd.Series] = {}
+    notes: list[str] = []
+    for pair in FX_PAIRS:
+        try:
+            if pair.spot_id:
+                series = fetch_series(pair.spot_id, start_date, end_date)
+            else:
+                series = _fetch_pen_spot(start_date, end_date)
+        except (FredAPIError, FxSourceError) as exc:
+            notes.append(f"{pair.ccy} spot unavailable — {exc}")
+            continue
+        if series.empty:
+            notes.append(f"{pair.ccy} spot: no observations in this range")
+            continue
+        columns[pair.ccy] = series
+    frame = pd.DataFrame(columns).sort_index()
+    frame.index.name = "date"
+    return frame, list(dict.fromkeys(notes))
+
+
+def _parse_bis_policy(text: str) -> pd.DataFrame:
+    """BIS SDMX-CSV -> date-indexed frame, one column per ``REF_AREA``."""
+    raw = pd.read_csv(io.StringIO(text), usecols=["REF_AREA", "TIME_PERIOD", "OBS_VALUE"])
+    raw["TIME_PERIOD"] = pd.to_datetime(raw["TIME_PERIOD"])
+    raw["OBS_VALUE"] = pd.to_numeric(raw["OBS_VALUE"], errors="coerce")
+    raw = raw.dropna(subset=["OBS_VALUE"]).drop_duplicates(["REF_AREA", "TIME_PERIOD"], keep="last")
+    frame = raw.pivot(index="TIME_PERIOD", columns="REF_AREA", values="OBS_VALUE").sort_index()
+    frame.index.name = "date"
+    frame.columns.name = None
+    return frame
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def fetch_policy_rates(start_date: str, end_date: str) -> tuple[pd.DataFrame, str | None]:
+    """``(frame, note)`` — central-bank policy rates in percent from the BIS,
+    daily, one column per BIS area code (:data:`FX_PAIRS` areas plus the US).
+    Fetched from a little before ``start_date`` so a forward-fill onto the first
+    spot date has a value to carry. Any failure returns an empty frame plus a
+    note, so the tab shows spot without carry rather than erroring."""
+    areas = "+".join([FX_USD_AREA, *(p.area for p in FX_PAIRS)])
+    begin = (pd.Timestamp(start_date) - pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+    try:
+        response = requests.get(
+            BIS_POLICY_URL + areas,
+            params={"startPeriod": begin, "endPeriod": end_date, "detail": "dataonly"},
+            headers={"Accept": "application/vnd.sdmx.data+csv;version=1.0.0"},
+            timeout=45,
+        )
+        response.raise_for_status()
+        frame = _parse_bis_policy(response.text)
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        return pd.DataFrame(), f"Policy rates unavailable — BIS fetch failed ({type(exc).__name__})"
+    if frame.empty:
+        return pd.DataFrame(), "Policy rates unavailable — BIS returned no data"
+    return frame, None
+
+
+@st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
+def fetch_fx_window() -> tuple[pd.DataFrame, pd.DataFrame, list[str]]:
+    """``(spot, rates, notes)`` over ~14 months — enough for the 1D/1M changes
+    and the 63-observation realized vol regardless of the selected period."""
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.DateOffset(months=14)
+    spot, notes = fetch_fx_spot(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    rates, rate_note = fetch_policy_rates(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"))
+    return spot, rates, [*notes, *([rate_note] if rate_note else [])]
+
+
+# Live spot: Yahoo Finance hourly bars (yfinance). Yahoo's *daily* FX closes are
+# unreliable — a BRL bar closed 8% from the real level and JPY moves landed a day
+# late — but its hourly bars agree with the Fed's noon-NY H.10 fix (and, for PEN,
+# BCRP's official rate) to ~0.05-0.13% on average (max 0.47%), so only hourly bars
+# are used, and only for the latest price and the two reference prices (24 hours
+# and 1 month earlier, same clock time). Everything falls back to the settled
+# H.10/BCRP series when Yahoo is unavailable.
+YAHOO_FX_TICKERS: dict[str, str] = {
+    "EUR": "EURUSD=X", "JPY": "JPY=X", "GBP": "GBPUSD=X", "MXN": "MXN=X", "PEN": "PEN=X",
+    "BRL": "BRL=X", "AUD": "AUDUSD=X", "CHF": "CHF=X", "CAD": "CAD=X",
+}                                   # same quote direction as FRED's H.10 / BCRP series
+_FX_LIVE_TTL = 5 * 60
+_FX_LIVE_MAX_AGE = pd.Timedelta(days=5)    # covers a long weekend with markets closed
+_FX_LIVE_MAX_GAP = 0.25                    # live vs last settled: beyond this, reject (scale/orientation error)
+_FX_EASTERN = "America/New_York"
+
+
+def live_from_hourly(close: pd.DataFrame) -> pd.DataFrame:
+    """Latest price and the reference prices from hourly closes. ``close`` has a
+    tz-aware DatetimeIndex and one column per currency code. Returns a frame
+    indexed by currency with ``Price`` (latest non-missing bar), ``AsOf`` (that
+    bar's time, US Eastern, tz-naive), ``Ref1D`` / ``Ref1M`` (the last bar on or
+    before 24 hours / 1 calendar month earlier — the Rate Change table's
+    lookback convention — NaN when there is none). Pure."""
+    close = close.tz_convert("UTC")        # one clock for the arithmetic, whatever tz Yahoo labels bars in
+    rows = {}
+    for ccy in close.columns:
+        s = close[ccy].dropna().sort_index()
+        if s.empty:
+            continue
+        asof, price = s.index[-1], float(s.iloc[-1])
+        refs = []
+        for target in (asof - pd.Timedelta(hours=24), asof - pd.DateOffset(months=1)):
+            prior = s.loc[:target]
+            refs.append(float(prior.iloc[-1]) if not prior.empty else float("nan"))
+        rows[ccy] = {
+            "Price": price,
+            "AsOf": asof.tz_convert(_FX_EASTERN).tz_localize(None),
+            "Ref1D": refs[0], "Ref1M": refs[1],
+        }
+    return pd.DataFrame.from_dict(rows, orient="index", columns=["Price", "AsOf", "Ref1D", "Ref1M"])
+
+
+@st.cache_data(ttl=_FX_LIVE_TTL, show_spinner=False)
+def fetch_fx_live() -> tuple[pd.DataFrame, str | None]:
+    """``(frame, note)`` — :func:`live_from_hourly` for :data:`YAHOO_FX_TICKERS`.
+    A currency whose latest bar is more than 5 days old, or whose price is more
+    than 25% from the last settled H.10 print, is dropped (so a stale or mis-scaled
+    Yahoo row can never reach the table). Any failure returns an empty frame and a
+    short note, and the tab falls back to the settled rates. Cached 5 minutes."""
+    empty = pd.DataFrame(columns=["Price", "AsOf", "Ref1D", "Ref1M"])
+    try:
+        import yfinance as yf
+        raw = yf.download(
+            list(YAHOO_FX_TICKERS.values()), period="2mo", interval="1h",
+            auto_adjust=False, progress=False, threads=False, timeout=20,
+        )
+        close = raw["Close"].rename(columns={t: c for c, t in YAHOO_FX_TICKERS.items()})
+        close.index = pd.DatetimeIndex(close.index)
+        if close.index.tz is None:
+            close.index = close.index.tz_localize("UTC")
+    except Exception as exc:  # noqa: BLE001 — a flaky scrape must never break the tab
+        return empty, f"Live prices unavailable — Yahoo Finance fetch failed ({type(exc).__name__})"
+    live = live_from_hourly(close)
+    if live.empty:
+        return empty, "Live prices unavailable — Yahoo Finance returned no data"
+
+    now = pd.Timestamp.now(tz=_FX_EASTERN).tz_localize(None)
+    settled = fetch_fx_window()[0]
+    keep, dropped = [], []
+    for ccy in live.index:
+        stale = now - live.at[ccy, "AsOf"] > _FX_LIVE_MAX_AGE
+        last = settled[ccy].dropna() if ccy in settled else pd.Series(dtype="float64")
+        off = (not last.empty) and abs(live.at[ccy, "Price"] / float(last.iloc[-1]) - 1.0) > _FX_LIVE_MAX_GAP
+        (dropped if stale or off else keep).append(ccy)
+    note = (f"Live price unavailable for {', '.join(dropped)} (stale or implausible Yahoo data); "
+            "using the settled rate") if dropped else None
+    return live.loc[keep], note
+
+
+def fx_change_pct(
+    series: pd.Series, usd_per_fc: bool, keys: tuple[str, ...] = FX_CHANGE_KEYS
+) -> dict[str, float]:
+    """Percent change in the *foreign currency's* value against the USD, so a
+    positive number always means the foreign currency strengthened — whichever
+    way the pair is quoted. Pure. Each change compares the latest observation
+    with the last observation on or before the lookback date (the Rate Change
+    table's convention); ``NaN`` where there is no history."""
+    s = series.dropna().sort_index()
+    if s.empty:
+        return {key: float("nan") for key in keys}
+    asof, latest = s.index[-1], float(s.iloc[-1])
+    out: dict[str, float] = {}
+    for key in keys:
+        prior = s.loc[: _lookback_date(asof, key)]
+        if prior.empty:
+            out[key] = float("nan")
+            continue
+        before = float(prior.iloc[-1])
+        change = (latest / before - 1.0) if usd_per_fc else (before / latest - 1.0)
+        change = round(change * 100.0, 2)
+        out[key] = change if change != 0 else 0.0
+    return out
+
+
+def fx_realized_vol(series: pd.Series, days: int = FX_VOL_DAYS) -> float:
+    """Annualized realized vol of an FX rate, in percent: sample standard
+    deviation (ddof=1) of the last ``days`` daily log returns, times sqrt(252).
+    Log returns make the figure the same whichever way the pair is quoted.
+    ``NaN`` without ``days`` + 1 observations."""
+    s = series.dropna().sort_index()
+    if len(s) < days + 1:
+        return float("nan")
+    returns = np.log(s.iloc[-(days + 1):]).diff().dropna()
+    return float(returns.std(ddof=1) * np.sqrt(252) * 100.0)
+
+
+def _pct_vs_ref(price: float, ref, usd_per_fc: bool) -> float:
+    """The foreign currency's % move against the USD from ``ref`` to ``price``
+    (positive = it strengthened), 2 dp; NaN with no reference. Pure."""
+    if ref is None or pd.isna(ref):
+        return float("nan")
+    change = round(((price / ref - 1.0) if usd_per_fc else (ref / price - 1.0)) * 100.0, 2)
+    return change if change != 0 else 0.0
+
+
+FX_TABLE_COLUMNS = (
+    "Spot", "1D %", "1M %", "Rate %", "vs USD", "Vol %", "Carry/vol", "Spot as of", "Rate as of",
+)
+
+
+def carry_table(
+    spot: pd.DataFrame, rates: pd.DataFrame, live: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """One row per :data:`FX_PAIRS` pair (indexed by its market label).
+
+    ``Spot`` is the latest observation in the pair's native quote; ``1D %`` /
+    ``1M %`` the foreign currency's move vs the USD (see :func:`fx_change_pct`);
+    ``Rate %`` the local policy rate; ``vs USD`` that rate minus the US rate, in
+    percentage points (positive = holding the foreign currency funded in USD
+    earns the differential); ``Vol %`` the 63-observation realized FX vol; and
+    ``Carry/vol`` the differential per point of vol. Each side carries its own
+    as-of date. Anything missing is ``NaN``/``NaT`` rather than guessed. Pure.
+    """
+    us = rates[FX_USD_AREA].dropna() if FX_USD_AREA in rates else pd.Series(dtype="float64")
+    us_rate = float(us.iloc[-1]) if not us.empty else float("nan")
+
+    records: dict[str, dict] = {}
+    for pair in FX_PAIRS:
+        rec: dict = {col: float("nan") for col in FX_TABLE_COLUMNS}
+        rec["Spot as of"] = rec["Rate as of"] = pd.NaT
+        s = spot[pair.ccy].dropna() if pair.ccy in spot else pd.Series(dtype="float64")
+        r = rates[pair.area].dropna() if pair.area in rates else pd.Series(dtype="float64")
+        if not s.empty:
+            moves = fx_change_pct(s, pair.usd_per_fc)
+            rec["Spot"] = float(s.iloc[-1])
+            rec["1D %"], rec["1M %"] = moves["1D"], moves["1M"]
+            rec["Vol %"] = fx_realized_vol(s)
+            rec["Spot as of"] = s.index[-1]
+        if live is not None and pair.ccy in live.index:
+            # live overlay: the price, and its change vs the same time 24h / 1 month
+            # earlier (all Yahoo hourly bars, so the two ends share one basis); the
+            # vol stays on the settled series
+            row = live.loc[pair.ccy]
+            rec["Spot"] = float(row["Price"])
+            rec["Spot as of"] = pd.Timestamp(row["AsOf"]).normalize()
+            for col, ref in (("1D %", row["Ref1D"]), ("1M %", row["Ref1M"])):
+                rec[col] = _pct_vs_ref(float(row["Price"]), ref, pair.usd_per_fc)
+        if not r.empty:
+            rec["Rate %"] = float(r.iloc[-1])
+            rec["Rate as of"] = r.index[-1]
+            if not np.isnan(us_rate):
+                rec["vs USD"] = round(rec["Rate %"] - us_rate, 4)
+        if not np.isnan(rec["vs USD"]) and rec["Vol %"] > 0:
+            rec["Carry/vol"] = rec["vs USD"] / rec["Vol %"]
+        records[pair.pair] = rec
+    return pd.DataFrame.from_dict(records, orient="index", columns=list(FX_TABLE_COLUMNS))
+
+
 @st.cache_data(ttl=_CACHE_TTL, show_spinner=False)
 def regime_history(end_date: str) -> tuple[pd.DataFrame, str | None]:
     """``(frame, note)`` — daily 10Y yield (``y10``, percent) and MOVE
@@ -1052,3 +1408,23 @@ def validation_status() -> dict | None:
     except ValueError:
         return None
     return status if isinstance(status, dict) else None
+
+
+def carry_vol_points(table: pd.DataFrame) -> pd.DataFrame:
+    """The carry-vs-volatility scatter's points, taken straight from a
+    :func:`carry_table` frame so the chart can never disagree with the table:
+    one row per pair that has both a carry (``vs USD``) and a realized vol,
+    with columns ``Ccy``, ``Pair``, ``Group``, ``Vol``, ``Carry``, ``CarryVol``.
+    Pure."""
+    rows = []
+    for pair in FX_PAIRS:
+        if pair.pair not in table.index:
+            continue
+        carry, vol = table.at[pair.pair, "vs USD"], table.at[pair.pair, "Vol %"]
+        if pd.isna(carry) or pd.isna(vol):
+            continue
+        rows.append({
+            "Ccy": pair.ccy, "Pair": pair.pair, "Group": pair.group,
+            "Vol": float(vol), "Carry": float(carry), "CarryVol": table.at[pair.pair, "Carry/vol"],
+        })
+    return pd.DataFrame(rows, columns=["Ccy", "Pair", "Group", "Vol", "Carry", "CarryVol"])

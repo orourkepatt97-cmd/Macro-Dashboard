@@ -7,8 +7,10 @@ here comes from ``data.py``.
 from __future__ import annotations
 
 import html
+from collections import Counter
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -22,16 +24,24 @@ import markets
 import theme
 from data import (
     CREDIT_SERIES,
+    FX_GROUPS,
+    FX_PAIRS,
+    FX_USD_AREA,
     FredAPIError,
     INFLATION_SERIES,
     TREASURY_SERIES,
     auto_regime_path,
+    carry_table,
+    carry_vol_points,
     changes_bps,
     fetch_change_window,
     fetch_cpi_nowcasts,
     fetch_credit_spreads,
     fetch_credit_window,
     fetch_curve_snapshot,
+    fetch_fx_live,
+    fetch_fx_spot,
+    fetch_fx_window,
     fetch_inflation,
     fetch_labor,
     fetch_nfp_forecasts,
@@ -152,8 +162,8 @@ head_l, head_r = st.columns([5, 4], vertical_alignment="top")
 with head_l:
     st.title("Macro Dashboard")
     st.caption(
-        "Treasury rates & curve, credit spreads, inflation, Fed-decision pricing, "
-        "and market news."
+        "Treasury rates, rate regime, inflation, labor, credit, FX carry, "
+        "Fed-decision odds, and news."
     )
 with head_r:
     period = st.pills(
@@ -292,9 +302,9 @@ def _tab(container):
 
 (
     rates_tab, rate_env_tab, inflation_tab, labor_tab,
-    credit_tab, news_tab, calendar_tab,
+    credit_tab, fx_tab, news_tab, calendar_tab,
 ) = st.tabs(
-    ["Rates", "Rate Environment", "Inflation", "Labor", "Credit", "News", "Calendar"]
+    ["Rates", "Rate Environment", "Inflation", "Labor", "Credit", "FX", "News", "Calendar"]
 )
 
 # ========================================================================
@@ -1127,6 +1137,178 @@ with _tab(credit_tab):
 
     with st.expander("Credit data"):
         st.dataframe(credit_range.sort_index(ascending=False), width="stretch")
+
+# ========================================================================
+# FX tab
+# ========================================================================
+with _tab(fx_tab):
+    fx_spot_hist, fx_rates_hist, fx_notes = fetch_fx_window()
+    fx_live, fx_live_note = fetch_fx_live()      # Yahoo hourly: latest price + 24h / 1M references
+    for note in [*fx_notes, *([fx_live_note] if fx_live_note else [])]:
+        st.caption(f"⚠️ {note}")
+    if fx_spot_hist.dropna(how="all").empty:
+        st.warning("No FX spot data is available right now.")
+        _stop_tab()
+
+    # --- Spot + carry table (fixed ~14-month window, independent of the period) ---
+    # Two groups (G10, EM), each sorted by carry/vol, highest first, with a muted
+    # label row above each group. Every cell is pre-formatted text (so the table is
+    # Arrow-safe); the green/red comes from a parallel frame of the raw changes.
+    fx_tbl = carry_table(fx_spot_hist, fx_rates_hist, fx_live)
+    _fx_decimals = {pair.pair: pair.decimals for pair in FX_PAIRS}
+    _COL_1D, _COL_1M = "1D % (ccy vs USD)", "1M % (ccy vs USD)"
+    _FX_COLS = ["Spot", _COL_1D, _COL_1M, "Policy rate (%)", "Carry (pp)", "3M vol (%)", "Carry/vol"]
+
+    def _fx_num(value, decimals: int, signed: bool = True) -> str:
+        """Half-up-rounded number text (so -2.625 reads -2.63, not the float-artefact
+        -2.62); NaN -> an en dash."""
+        if value is None or pd.isna(value):
+            return "–"
+        q = Decimal(str(round(float(value), 6))).quantize(
+            Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
+        if q == 0:
+            return f"{abs(q)}"            # a true zero (after rounding) carries no sign
+        return f"{q:+}" if signed else f"{q}"
+
+    fx_text: list[dict[str, str]] = []
+    fx_colour: list[dict[str, str]] = []
+    fx_index: list[str] = []
+    for group in FX_GROUPS:
+        members = fx_tbl.loc[[p.pair for p in FX_PAIRS if p.group == group]]
+        members = members.sort_values("Carry/vol", ascending=False, na_position="last")
+        fx_index.append(group)
+        fx_text.append({col: "" for col in _FX_COLS})
+        fx_colour.append({col: "" for col in _FX_COLS})
+        for label, row in members.iterrows():
+            fx_index.append(label)
+            fx_text.append({
+                "Spot": "–" if pd.isna(row["Spot"]) else f"{row['Spot']:.{_fx_decimals[label]}f}",
+                _COL_1D: _fx_num(row["1D %"], 2), _COL_1M: _fx_num(row["1M %"], 2),
+                "Policy rate (%)": _fx_num(row["Rate %"], 2, signed=False),
+                "Carry (pp)": _fx_num(row["vs USD"], 2),
+                "3M vol (%)": _fx_num(row["Vol %"], 1, signed=False),
+                "Carry/vol": _fx_num(row["Carry/vol"], 2),
+            })
+            fx_colour.append({
+                **{col: "" for col in _FX_COLS},
+                _COL_1D: _sign_color(row["1D %"]) or "", _COL_1M: _sign_color(row["1M %"]) or "",
+            })
+    _fx_idx = pd.Index(fx_index, name="Pair")
+    fx_shown = pd.DataFrame(fx_text, index=_fx_idx, columns=_FX_COLS)
+    fx_colours = pd.DataFrame(fx_colour, index=_fx_idx, columns=_FX_COLS)
+    st.table(
+        fx_shown.style
+        .apply(lambda _: fx_colours, axis=None)
+        .set_properties(**{"text-align": "right"})
+        .apply_index(
+            lambda idx: ["color: #8a8a8a; letter-spacing: 0.12em" if label in FX_GROUPS else "" for label in idx],
+            axis=0,
+        )
+    )
+
+    # Footnote: the dates are whatever the data says — the most common spot date and
+    # rate date, then only the rows that differ from them.
+    def _common_date(column: str):
+        counts = Counter(d for d in fx_tbl[column] if pd.notna(d))
+        return max(counts, key=lambda d: (counts[d], d)) if counts else None
+
+    _spot_common, _rate_common = _common_date("Spot as of"), _common_date("Rate as of")
+    _us_series = fx_rates_hist[FX_USD_AREA].dropna() if FX_USD_AREA in fx_rates_hist else pd.Series(dtype="float64")
+    _exceptions = []
+    for pair in FX_PAIRS:
+        spot_day, rate_day = fx_tbl.at[pair.pair, "Spot as of"], fx_tbl.at[pair.pair, "Rate as of"]
+        if _spot_common is not None and spot_day != _spot_common:
+            _exceptions.append(
+                f"{pair.ccy} spot {'n/a' if pd.isna(spot_day) else f'{spot_day:%b %d}'}"
+                + (" (BCRP)" if pair.spot_id is None else ""))
+        if _rate_common is not None and rate_day != _rate_common:
+            _exceptions.append(f"{pair.ccy} rate {'n/a' if pd.isna(rate_day) else f'{rate_day:%b %d}'}")
+    if not fx_live.empty:
+        _spot_text = (
+            "Spot: Yahoo Finance live prices (unofficial), as of "
+            f"{fx_live['AsOf'].max():%b %d, %I:%M %p} ET; 1D and 1M compare with the same hour "
+            "24 hours and one month earlier"
+        )
+    else:
+        _spot_text = (
+            "Spot: Fed H.10 noon NY rate (lagged several business days)"
+            + (f", as of {_spot_common:%b %d}" if _spot_common is not None else "")
+        )
+    _foot = [
+        _spot_text + ". Policy rates: BIS"
+        + (f", as of {_rate_common:%b %d}" if _rate_common is not None else "")
+        + ("; US = midpoint of Fed target range "
+           f"({_us_series.iloc[-1]:g}%)." if not _us_series.empty else "."),
+    ]
+    if _exceptions:
+        _foot.append("Exceptions: " + "; ".join(_exceptions) + ".")
+    _foot.append(
+        "Carry uses policy-rate differentials as a proxy; forward-implied carry would be "
+        "more precise. Carry/vol = carry ÷ 3M realized vol."
+    )
+    st.caption("  \n".join(_foot))
+
+    # --- Carry vs volatility ------------------------------------------------------
+    st.subheader("Carry vs volatility")
+    fx_pts = carry_vol_points(fx_tbl)          # built from the table above — same numbers
+    if fx_pts.empty:
+        st.info("Carry and volatility are unavailable (policy-rate or spot data missing).")
+    else:
+        _GROUP_COLOURS = {"G10": "#7f8fbf", "EM": "#cf9038"}
+        x_hi = float(fx_pts["Vol"].max()) * 1.15
+        y_lo, y_hi = min(0.0, float(fx_pts["Carry"].min())), max(0.0, float(fx_pts["Carry"].max()))
+        y_pad = ((y_hi - y_lo) or 1.0) * 0.1
+        # the upper bound also guarantees the 0.5 ray ends on the right edge, where it is labelled
+        y_rng = [y_lo - y_pad, max(y_hi + y_pad, 0.5 * x_hi)]
+        positions = theme.place_labels(
+            fx_pts["Vol"].tolist(), fx_pts["Carry"].tolist(), fx_pts["Ccy"].tolist(),
+            x_range=[0.0, x_hi], y_range=y_rng,
+        )
+        fx_pts = fx_pts.assign(Position=positions)
+        scatter = go.Figure()
+        for k in (0.25, 0.5):
+            scatter.add_trace(go.Scatter(
+                x=[0, x_hi], y=[0, k * x_hi], mode="lines", hoverinfo="skip", showlegend=False,
+                line=dict(color="rgba(160,160,160,0.35)", width=1, dash="dash"),
+            ))
+            scatter.add_annotation(
+                x=x_hi, y=k * x_hi, text=f"carry/vol {k:g}", showarrow=False,
+                xanchor="left", xshift=6, font=dict(size=10, color="#8a8a8a"),
+            )
+        for group in FX_GROUPS:
+            part = fx_pts[fx_pts["Group"] == group]
+            if part.empty:
+                continue
+            scatter.add_trace(go.Scatter(
+                x=part["Vol"], y=part["Carry"], mode="markers+text", name=group,
+                text=part["Ccy"], textposition=part["Position"].tolist(),
+                textfont=dict(size=12, color=_GROUP_COLOURS[group]),
+                marker=dict(size=11, color=_GROUP_COLOURS[group]),
+                customdata=part[["Carry", "Vol", "CarryVol"]].to_numpy(),
+                hovertemplate=(
+                    "<b>%{text}</b><br>Carry: %{customdata[0]:+.2f} pp"
+                    "<br>3M vol: %{customdata[1]:.1f}%"
+                    "<br>Carry/vol: %{customdata[2]:+.2f}<extra></extra>"
+                ),
+            ))
+        scatter.add_hline(y=0, line=dict(color="#6a6a6a", width=1))
+        scatter.update_layout(
+            height=460, margin=dict(l=60, r=110, t=10, b=40), showlegend=False, hovermode="closest",
+        )
+        scatter.update_xaxes(title_text="3M realized vol (%)", range=[0, x_hi], tickformat=".0f")
+        scatter.update_yaxes(title_text="Carry vs USD (pp)", range=y_rng, tickformat=".0f", zeroline=False)
+        theme.render_chart(scatter)
+        st.caption(
+            "<span style='color:#7f8fbf'>●</span> G10 &nbsp; <span style='color:#cf9038'>●</span> EM"
+            " &nbsp;·&nbsp; Up and to the left is more carry for less risk; the dashed rays mark"
+            " carry/vol of 0.25 and 0.5.",
+            unsafe_allow_html=True,
+        )
+
+    # Raw spot history for the selected period (the settled H.10 / BCRP series).
+    fx_spot, _ = fetch_fx_spot(start_date.isoformat(), end_date.isoformat())
+    with st.expander("FX data"):
+        st.dataframe(fx_spot.sort_index(ascending=False), width="stretch")
 
 # ========================================================================
 # News tab

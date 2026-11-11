@@ -394,3 +394,68 @@ def pick_labels(
         placed.append(box)
         chosen.append(i)
     return chosen
+
+
+_LABEL_POSITIONS = (
+    "top center", "bottom center", "middle right", "middle left",
+    "top right", "top left", "bottom right", "bottom left",
+)
+
+
+def place_labels(
+    xs, ys, texts, *, x_range, y_range, size=(900, 430),
+    char_px=7.2, line_h=14.0, pad=2.0, marker_radius=8.0, gap=3.0,
+):
+    """A Plotly ``textposition`` for every scatter point so no label overlaps
+    another label or another point's marker. Unlike :func:`pick_labels` this never
+    drops a label: each point, in order, takes the first of eight positions around
+    its marker that stays inside the plot and touches nothing already placed; if
+    none is clear it takes the position with the fewest collisions. Geometry is
+    estimated like :func:`pick_labels` (data -> pixels over an assumed plot
+    ``size``, ``char_px`` per character of a ~12px monospace label), so a much
+    narrower window has less room than assumed. Returns one position per point.
+    """
+    width, height = size
+    n = len(xs)
+    pts = [((x - x_range[0]) / (x_range[1] - x_range[0]) * width,
+            (y_range[1] - y) / (y_range[1] - y_range[0]) * height) for x, y in zip(xs, ys)]
+    r = marker_radius
+
+    def box(position, px, py, text):
+        w, h = len(text) * char_px, line_h
+        vertical, horizontal = position.split()
+        if horizontal == "center":
+            x0 = px - w / 2
+        elif horizontal == "right":
+            x0 = px + (r + gap if vertical == "middle" else r * 0.7)
+        else:
+            x0 = px - (r + gap if vertical == "middle" else r * 0.7) - w
+        if vertical == "top":
+            y0 = py - r - gap - h
+        elif vertical == "bottom":
+            y0 = py + r + gap
+        else:
+            y0 = py - h / 2
+        return (x0, y0, x0 + w, y0 + h)
+
+    def touches(a, b):
+        return not (a[2] + pad < b[0] or b[2] + pad < a[0] or a[3] + pad < b[1] or b[3] + pad < a[1])
+
+    markers = [(px - r, py - r, px + r, py + r) for px, py in pts]
+    placed: list[tuple] = []
+    chosen: list[str] = []
+    for i in range(n):
+        best, best_cost = _LABEL_POSITIONS[0], None
+        for position in _LABEL_POSITIONS:
+            b = box(position, *pts[i], texts[i])
+            cost = sum(touches(b, o) for o in placed)
+            cost += sum(touches(b, markers[j]) for j in range(n) if j != i)
+            if b[0] < 0 or b[2] > width or b[1] < 0 or b[3] > height:
+                cost += 100
+            if best_cost is None or cost < best_cost:
+                best, best_cost = position, cost
+            if cost == 0:
+                break
+        placed.append(box(best, *pts[i], texts[i]))
+        chosen.append(best)
+    return chosen

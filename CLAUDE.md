@@ -1,7 +1,8 @@
 # CLAUDE.md — briefing for a fresh session
 
-Streamlit macro dashboard: US rates/curve, curve-change table, credit spreads,
-inflation, labor, an economic calendar, Fed-decision odds, and market news.
+Streamlit macro dashboard: US rates/curve, curve-change table, rate regime and
+volatility, credit spreads, inflation, labor, FX spot and carry, an economic
+calendar, Fed-decision odds, and market news.
 Run: `streamlit run app.py` (needs `FRED_API_KEY`; see below).
 
 `python validate.py` (`--quiet` for cron/CI use) independently audits the data
@@ -12,7 +13,11 @@ own history. Checks: series resolve + no gaps + freshness (via FRED's own
 for why that distinction matters; `_LAG_BUDGET_OVERRIDES` holds the one
 documented exception, `THREEFYTP10`'s weekly-batch cadence); every
 YoY/spread/rolling-average/realized-vol value re-derived independently and
-compared to what `data.py`/`app.py` compute (including the Rate Regime chart's
+compared to what `data.py`/`app.py` compute (including the FX tab's carry table
+— spot, 1D/1M change, 63-day realized vol, policy rate, differential, carry/vol
+— recomputed from raw FRED/BCRP/BIS fetches of its own, with shape checks on the
+BIS and BCRP feeds, BIS-vs-FRED policy-rate cross-checks, each series' quote
+orientation read from its source's own label; and the Rate Regime chart's
 joined frame, current regime run, and path — every cadence × several windows
 × every anchor weekday, with plain loops/`bisect` and stdlib calendar maths, plus
 a direct check that the auto cadence keeps every standard period at a readable
@@ -28,7 +33,8 @@ matching a declared, verified entry in `_KNOWN_GAPS` (currently: the real Oct
 instead of FAIL and doesn't affect the exit code, but is still listed every
 run in its own "Known exceptions" section (always printed, `--quiet`
 included) so it can't quietly turn into a FAIL you've learned to ignore. As
-of this writing: 141/141 passed, 4 known exceptions.
+of this writing: 312/312 passed, 5 known exceptions (the four Oct 2025 gaps, plus
+Mexico's BIS-vs-FRED policy-rate disagreement — see the FX data-source notes).
 
 Every run writes `validate_status.json` next to the script (gitignored —
 `data.validation_status()` reads it, with no error if it's missing). The
@@ -57,14 +63,14 @@ as any environment where validate.py hasn't run.
 
 | File | Responsibility |
 | --- | --- |
-| `app.py` | UI only. Top-of-page controls (period pills + custom-range popover), the 7 tabs, all chart/table assembly. No network calls of its own — everything comes from the other modules. |
-| `data.py` | All FRED access + every other data fetch (Cleveland Fed nowcast, FX Blue NFP forecast, MOVE via yfinance) + pure transforms (`movement_table`, `changes_bps`, `spread`, `curve_snapshots`, `release_calendar`, `fomc_meeting_dates`, `release_overdue`). Rate Environment fetchers: `realized_vol_10y`, `move_index`, `term_premium`. Fetchers are `@st.cache_data`. `_load_api_key(name)` = `st.secrets` then `.env`. |
+| `app.py` | UI only. Top-of-page controls (period pills + custom-range popover), the 8 tabs, all chart/table assembly. No network calls of its own — everything comes from the other modules. |
+| `data.py` | All FRED access + every other data fetch (Cleveland Fed nowcast, FX Blue NFP forecast, MOVE via yfinance) + pure transforms (`movement_table`, `changes_bps`, `spread`, `curve_snapshots`, `release_calendar`, `fomc_meeting_dates`, `release_overdue`). Rate Environment fetchers: `realized_vol_10y`, `move_index`, `term_premium`. FX fetchers: `fetch_fx_spot`, `fetch_policy_rates`, `fetch_fx_window` (BCRP and BIS parsers inside) and the pure `carry_table`, `fx_change_pct`, `fx_realized_vol`; the currency list is `FX_PAIRS`. Fetchers are `@st.cache_data`. `_load_api_key(name)` = `st.secrets` then `.env`. |
 | `feeds.py` | RSS/Atom fetch + parse for the News tab. Concurrent, 15-min cache, dedupe by normalized URL + fuzzy title. One dead feed never breaks the tab. |
 | `markets.py` | Kalshi Fed-decision markets (public REST, no auth). 5-min cache. Returns `(frame, note, fetched_at)`; any failure → empty frame + note. |
 | `theme.py` | Terminal styling: global CSS injected via `st.markdown`, the shared Plotly template (`bloomberg`), `TENOR_LINE` per-tenor line styles, `_PILL_TINTS` (pill-underline colours, must match the `_*_SPEC` colour lists in `app.py`), `render_chart()`. |
 
-Tabs, in order: **Rates · Rate Environment · Inflation · Labor · Credit · News ·
-Calendar**. Rate Change is no longer its own tab — it's a section inside Rates,
+Tabs, in order: **Rates · Rate Environment · Inflation · Labor · Credit · FX ·
+News · Calendar**. Rate Change is no longer its own tab — it's a section inside Rates,
 between "Yields over time" and the yield-curve snapshot chart. The `with` blocks
 in `app.py` run in this same order, and nothing depends on tab position: tabs are
 bound by variable name, every pill group has a stable string key, and the
@@ -79,8 +85,8 @@ carries on with the next tab. The two `st.stop()`s in the page header (invalid
 custom date range) are real stops on purpose — no tab has a valid range then.
 Verified with simulated outages on the old vs. new code: an outage in one tab's
 fetch now blanks only the tabs that actually depend on it (e.g. a Treasury-yield
-outage blanks Rates, Rate Environment and Credit, but Inflation, Labor, News and
-Calendar still render; before, it blanked all seven). `_StopTab` is
+outage blanks Rates, Rate Environment and Credit, but Inflation, Labor, FX, News and
+Calendar still render; before, it blanked every tab after the failing one). `_StopTab` is
 swallowed silently; any other exception inside a tab is caught by `_tab()` and
 shown in that tab via `st.exception()`, so later tabs still render (Streamlit's
 own `st.stop`/rerun exceptions are `BaseException`, so they pass through).
@@ -140,6 +146,58 @@ kind of environment they're in. Three sections, rendered by
    `theme._PILL_TINTS`).
 3. **Term premium** — `THREEFYTP10` with a zero reference line; the sign is the read.
 
+**FX** (after Credit) is spot plus carry for nine currencies — EUR, JPY, GBP, MXN,
+PEN, BRL, AUD, CHF, CAD (`data.FX_PAIRS`, in that order), rendered inline in
+`app.py`'s `with _tab(fx_tab):` block. Quotes stay in market convention exactly as
+the source publishes them (EUR/USD, USD/JPY, USD/PEN…) and are never re-inverted;
+`FxPair.usd_per_fc` records which way each runs, and every *change* is expressed as
+the **foreign currency's** move against the USD (`fx_change_pct`), so green always
+means the currency strengthened. Parts:
+
+1. **Table** (fixed ~14-month window, independent of the period pills): Pair, Spot
+   (market quote — **live**, see below), 1D % and 1M % (labelled "ccy vs USD"), Policy rate (%) (the country's stated rate, BIS), Carry (pp), 3M vol (%),
+   Carry/vol. Two groups — G10 (EUR, JPY, GBP, AUD, CHF, CAD) and EM (MXN, BRL, PEN),
+   `FxPair.group` — each under a muted label row and sorted by carry/vol, highest
+   first. Cells are pre-formatted text (Arrow-safe; numbers rounded half-up so
+   -2.625 reads -2.63), green/red comes from a parallel frame of the raw changes.
+   Carry = local policy rate minus the US rate (positive: holding that currency
+   funded in USD earns it; negative: a funding currency). Vol is the sample std of
+   the last 63 daily log returns × √252 (orientation-independent); carry/vol uses
+   *realized* vol, not implied. 1D/1M use the Rate Change table's convention (last
+   observation on or before the lookback date). The footnote computes its dates
+   from the data (most common spot date and rate date, then only the rows that
+   differ) — nothing hard-coded.
+2. **Carry vs volatility** — scatter directly under the table: x = 3M vol, y =
+   carry, one labelled point per currency, G10 blue / EM amber (explained in a
+   caption, no legend), zero line, dashed rays at carry/vol 0.25 and 0.5 labelled at
+   the right edge (the y-axis top is raised so the 0.5 ray always ends there). Points
+   come from `data.carry_vol_points(table)`, so they are the table's numbers.
+   `theme.place_labels` picks one of eight label positions per point so labels never
+   overlap each other or a marker (estimated geometry over an assumed ~900px plot).
+**Live spot.** The table's Spot, 1D % and 1M % come from Yahoo Finance *hourly* bars
+(`data.fetch_fx_live`, 5-minute cache, one batch `yf.download`): Spot = the latest bar;
+1D / 1M = that price against the last bar on or before 24 hours / one calendar month
+earlier, all computed in UTC so both ends share a basis (`live_from_hourly`,
+`carry_table(..., live)`). PEN **is** live (`PEN=X`): an earlier version excluded it after seeing
+~3% jumps, but that was Yahoo's *daily* bars — its hourly PEN bars agree with BCRP's
+official rate to 0.11% on average (max 0.47%, 41 days). BCRP stays the settled history
+and the fallback. Vol, carry/vol and the
+stay on the settled H.10/BCRP series. **Never use Yahoo's *daily* FX
+closes** — measured against H.10 they are wrong or a day late on some bars (BRL closed
+8% off the real level on one bar; JPY moves landed a day late) — hourly bars at noon NY
+agree with H.10 to 0.05-0.13% on average (max 0.47%). A currency whose latest bar is
+>5 days old or >25% from its last settled rate is dropped to the settled rate, and any
+Yahoo failure falls back to the settled H.10 table with a ⚠️ note. The footnote text
+switches between "Yahoo Finance live prices … as of <time> ET" and the H.10 wording.
+
+Sources: settled spot = the Fed's H.10 via FRED (`DEXUSEU`, `DEXJPUS`, `DEXUSUK`, `DEXMXUS`,
+`DEXBZUS`, `DEXUSAL`, `DEXSZUS`, `DEXCAUS`; noon-NY rates, published weekly so
+~3 business days behind), PEN = Peru's central bank (BCRP) interbank rate; policy
+rates = BIS `WS_CBPOL` for all ten countries (US = mid-point of the Fed's target
+range, euro area = ECB deposit facility rate). **Failure handling:** each spot
+source fails independently (its own column drops and a ⚠️ caption names it); a BIS
+failure shows spot without carry. See the data-source notes for the quirks.
+
 ## UI conventions
 
 - Bloomberg-terminal look: near-black bg (`#0a0a0a`), light-grey text, monospace
@@ -153,7 +211,7 @@ kind of environment they're in. Three sections, rendered by
 - **Pill selectors** replace Plotly legends: `st.pills` multi-select, borderless
   text, each option tinted to its series colour with a 2px underline when
   selected, ~30% opacity when off. Keyed groups: `tenors`, `credit_series`,
-  `inflation_series`, `labor_ur`, `labor_claims`, `news_sources`. Colour lists
+  `inflation_series`, `labor_ur`, `labor_claims`, `vol_series`, `news_sources`. Colour lists
   live in `app.py` `_*_SPEC` and must stay in sync with `theme._PILL_TINTS`
   (matched by nth-of-type, so order matters).
 - Charts: `hovermode="closest"` on any chart with custom `hovertext` (the
@@ -207,6 +265,29 @@ kind of environment they're in. Three sections, rendered by
   shape-checks it (count / freshness / gaps / sane 40–200 range) and a partial
   or empty return FAILS — note GitHub Actions runner IPs may be blocked by
   Yahoo, in which case that check fails for environmental reasons.
+- **FX spot** (FRED H.10 + BCRP). H.10 is a **weekly** release (FRED vintage dates are
+  consecutive Mondays), so `validate.py` gives those eight series a 9-day freshness
+  override like `THREEFYTP10`. The sol is not in H.10 (`DEXPEUS` doesn't exist), so
+  PEN comes from BCRP's API
+  (`estadisticas.bcrp.gob.pe/estadisticas/series/api/PD04638PD/json/<start>/<end>`,
+  interbank sell rate, S/ per US$). It is free and unauthenticated but sometimes
+  answers with an anti-bot HTML page instead of JSON (the fetch retries three times);
+  period names use Spanish month abbreviations (`Set` = September), an unrecognised
+  month raises, and `n.d.` marks a day with no data (today's value is usually `n.d.`).
+- **Policy rates** (BIS `WS_CBPOL`, `stats.bis.org/api/v2`, no auth, SDMX-CSV with
+  `detail=dataonly`, ~1 MB for five years). Daily series for every country, about a
+  week behind (AU lags the most, ~2 weeks). Values can be `NaN` for a day (dropped).
+  Cross-checked in `validate.py`: euro area = FRED `ECBDFR`, US = the mid-point of
+  `DFEDTARU`/`DFEDTARL`, and JP/CA/AU/BR/GB month averages within 0.25pp of FRED's
+  monthly call-money series (`IRSTCI01xxM156N`). **Mexico disagrees by a persistent
+  ~1.3pp** (BIS 6.50 vs FRED 5.2 as month averages, every month of 2026) and is
+  reported as a KNOWN exception rather than a failure; the tab uses BIS. Unresolved
+  which is right — worth checking against Banxico directly (its API needs a token)
+  before relying on the MXN carry number. FRED's CHF and PEN rate series are unusable
+  (CHF stopped in 2024, PEN doesn't exist), which is why BIS is the rate source.
+- **FRED rate limit.** FRED allows ~120 requests/minute and answers 429 beyond it.
+  `data.fetch_series` backs off and retries twice on 429; `validate.py` (which makes
+  a few hundred calls) retries with longer backoff.
 - **Cleveland Fed inflation nowcast** — *not on FRED*. Scraped from
   `clevelandfed.org/-/media/files/webcharts/inflationnowcasting/nowcast_year.json`
   (~7 MB FusionCharts JSON, 6-hr cache). Fragile format; parses the final
@@ -259,6 +340,9 @@ kind of environment they're in. Three sections, rendered by
   while older ones still do) — and reports both while still keeping whatever
   data did parse, rather than silently reporting success either way.
 - Labor tab shows a 4th metric (AHE YoY) beyond the spec's 3 — leave or move.
+- FX: the Mexico policy-rate discrepancy above (BIS 6.50 vs FRED call-money 5.2) is
+  unresolved; and carry/vol uses realized vol, not implied (no free source for FX
+  implied vol).
 - FOMC dates need a yearly refresh (`_FOMC_DECISION_DAYS` in `data.py`).
 - The dev/sandbox FRED data looked synthetic (implausible payroll prints); real
   Cloud data will differ — don't tune visuals to the sample.
