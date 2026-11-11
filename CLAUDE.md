@@ -166,7 +166,8 @@ means the currency strengthened. Parts:
    *realized* vol, not implied. 1D/1M use the Rate Change table's convention (last
    observation on or before the lookback date). The footnote computes its dates
    from the data (most common spot date and rate date, then only the rows that
-   differ) — nothing hard-coded.
+   differ; plus a vol line giving the date the settled H.10/BCRP vol window ends, which
+   lags the live spot) — nothing hard-coded.
 2. **Carry vs volatility** — scatter directly under the table: x = 3M vol, y =
    carry, one labelled point per currency, G10 blue / EM amber (explained in a
    caption, no legend), zero line, dashed rays at carry/vol 0.25 and 0.5 labelled at

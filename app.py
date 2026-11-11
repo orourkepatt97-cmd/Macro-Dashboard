@@ -1242,6 +1242,23 @@ with _tab(fx_tab):
     ]
     if _exceptions:
         _foot.append("Exceptions: " + "; ".join(_exceptions) + ".")
+    # 3M vol runs on the settled series (H.10 / BCRP), which ends earlier than the live spot
+    _vol_ends = {
+        pair.ccy: fx_spot_hist[pair.ccy].dropna().index[-1]
+        for pair in FX_PAIRS if pair.ccy in fx_spot_hist and not fx_spot_hist[pair.ccy].dropna().empty
+    }
+    if _vol_ends:
+        _vol_counts = Counter(_vol_ends.values())
+        _vol_common = max(_vol_counts, key=lambda d: (_vol_counts[d], d))
+        _vol_other = [
+            f"{ccy} through {d:%b %d}" + (" (BCRP)" if ccy == "PEN" else "")
+            for ccy, d in _vol_ends.items() if d != _vol_common
+        ]
+        _foot.append(
+            "3M vol: annualized std. dev. of daily log returns, 63 observations through "
+            f"{_vol_common:%b %d}, Fed H.10 settled rates"
+            + (f"; {'; '.join(_vol_other)}." if _vol_other else ".")
+        )
     _foot.append(
         "Carry uses policy-rate differentials as a proxy; forward-implied carry would be "
         "more precise. Carry/vol = carry ÷ 3M realized vol."
