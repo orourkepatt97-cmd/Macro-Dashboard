@@ -1,8 +1,10 @@
 {
-  "run_at": "2026-11-17T04:07:17+00:00",
-  "passed": 303,
-  "failed": 0,
+  "run_at": "2026-11-24T05:28:18+00:00",
+  "passed": 302,
+  "failed": 1,
   "known": 5,
-  "ok": true,
-  "failing_checks": []
+  "ok": false,
+  "failing_checks": [
+    "FX live BRL: 24h reference is an earlier bar (12-96h before) and the feed is not a frozen tick"
+  ]
 }
