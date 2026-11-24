@@ -259,15 +259,6 @@ def _validation_line(status: dict | None) -> tuple[str, str | None]:
     return f"Validation passed as of {when} ({passed} checks{known_note})", _GREEN
 
 
-_val_text, _val_color = _validation_line(validation_status())
-if _val_color:
-    st.caption(
-        f"<span style='color:{_val_color}'>●</span> {html.escape(_val_text)}",
-        unsafe_allow_html=True,
-    )
-else:
-    st.caption(_val_text)
-
 # --- Tab isolation ---------------------------------------------------------
 # Streamlit runs every tab's code on every rerun, top to bottom, so a bare
 # st.stop() inside one tab halts the whole script and leaves every tab after it
@@ -1417,3 +1408,12 @@ with _tab(calendar_tab):
         st.markdown("\n".join(f"- {day:%A, %B %d, %Y}" for day in fomc))
     else:
         st.caption("No scheduled FOMC dates on file.")
+
+    _val_text, _val_color = _validation_line(validation_status())
+    if _val_color:
+        st.caption(
+            f"<span style='color:{_val_color}'>●</span> {html.escape(_val_text)}",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption(_val_text)

@@ -719,13 +719,15 @@ def check_fx_live(today: pd.Timestamp, app_spot: pd.DataFrame, app_rates: pd.Dat
             pos = bisect_right(times, target) - 1
             refs.append(bars[pos][1] if pos >= 0 else float("nan"))
         # the reference must be a genuinely different, earlier bar (not the live bar itself),
-        # and the feed must not be a frozen tick: >= 2 distinct values in the last 6 bars
+        # and the feed must not be a frozen tick: >= 2 distinct values in the last 24 bars
+        # (a day of bars; 6 was too few: BRL flat-lines for hours overnight when its market is shut,
+        # which tripped this at 00:28 ET on 2026-11-24 with five identical prints in a row)
         ref_gap = last_t - times[bisect_right(times, last_t - pd.Timedelta(hours=24)) - 1] \
             if bisect_right(times, last_t - pd.Timedelta(hours=24)) > 0 else None
-        distinct = len({round(v, 8) for _, v in bars[-6:]})
-        check(f"FX live {ccy}: 24h reference is an earlier bar (12-96h before) and the feed is not a frozen tick",
+        distinct = len({round(v, 8) for _, v in bars[-24:]})
+        check(f"FX live {ccy}: 24h reference is an earlier bar (12-96h before) and the feed is not frozen",
               ref_gap is not None and pd.Timedelta(hours=12) <= ref_gap <= pd.Timedelta(hours=96) and distinct >= 2,
-              f"reference gap {ref_gap}, {distinct} distinct values in the last 6 bars")
+              f"reference gap {ref_gap}, {distinct} distinct values in the last 24 bars")
         got = live.loc[ccy] if ccy in live.index else None
         if got is None:
             check(f"FX live {ccy}: present in the app's live frame", False, "dropped by the app (stale/implausible)")
